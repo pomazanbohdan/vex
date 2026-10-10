@@ -20,6 +20,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   installs `vex` and `vex-mcp` from the latest release into `~/.local/bin`
   (macOS arm64, Linux x86_64; `VEX_VERSION`, `VEX_INSTALL_DIR`, `VEX_NO_MCP`).
   It refuses musl and glibc older than 2.34 with a pointer to a source build.
+- **`install.ps1`** for Windows:
+  `irm https://raw.githubusercontent.com/tenatarika/vex/main/install.ps1 | iex`
+  installs `vex.exe`, `vex-mcp.exe` and `DirectML.dll` into
+  `%LOCALAPPDATA%\Programs\vex` and adds it to the user `PATH`. CI runs it on
+  Windows under PowerShell 7 and 5.1.
 - **`cargo binstall vex-search` / `vex-search-mcp`** download the prebuilt
   release binaries instead of compiling.
 
