@@ -120,9 +120,19 @@
         "name": "Repository"
       },
       {
+        "context": "void save();",
+        "line": 4,
+        "name": "save"
+      },
+      {
         "context": "mixin Logging {",
         "line": 7,
         "name": "Logging"
+      },
+      {
+        "context": "void log() {}",
+        "line": 8,
+        "name": "log"
       },
       {
         "context": "class Service extends Repository with Logging {",
@@ -145,9 +155,79 @@
         "name": "Service"
       },
       {
+        "context": "@override",
+        "line": 13,
+        "name": "override"
+      },
+      {
+        "context": "void save() {",
+        "line": 14,
+        "name": "save"
+      },
+      {
+        "context": "helper();",
+        "line": 15,
+        "name": "helper"
+      },
+      {
+        "context": "this.log();",
+        "line": 16,
+        "name": "log"
+      },
+      {
+        "context": "void refresh() => helper();",
+        "line": 18,
+        "name": "refresh"
+      },
+      {
+        "context": "void refresh() => helper();",
+        "line": 18,
+        "name": "helper"
+      },
+      {
+        "context": "void helper() {}",
+        "line": 21,
+        "name": "helper"
+      },
+      {
+        "context": "void run() {",
+        "line": 23,
+        "name": "run"
+      },
+      {
+        "context": "final service = Service();",
+        "line": 24,
+        "name": "service"
+      },
+      {
         "context": "final service = Service();",
         "line": 24,
         "name": "Service"
+      },
+      {
+        "context": "service.save();",
+        "line": 25,
+        "name": "service"
+      },
+      {
+        "context": "service.save();",
+        "line": 25,
+        "name": "save"
+      },
+      {
+        "context": "service..save()..refresh();",
+        "line": 26,
+        "name": "service"
+      },
+      {
+        "context": "service..save()..refresh();",
+        "line": 26,
+        "name": "save"
+      },
+      {
+        "context": "service..save()..refresh();",
+        "line": 26,
+        "name": "refresh"
       },
       {
         "context": "import 'dart:async';",

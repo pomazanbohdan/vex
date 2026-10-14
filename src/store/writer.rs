@@ -87,8 +87,6 @@ fn resolve_by_name_and_path(
 ///   file only** (filtering `name_to_global`'s candidates by
 ///   `sym_to_file_id`) — the child is always a local definition, so a
 ///   same-named symbol in a different file must not be picked.
-/// - `parent_name` is resolved via `name_to_global` mirroring the
-///   ref-edge single-candidate rule exactly (Q1 LOCKED):
 ///   - exactly one candidate → resolved edge.
 ///   - zero candidates (external/stdlib parent) → spill to
 ///     `unresolved_hierarchy`, keyed by the verbatim name. Spilled
@@ -106,12 +104,26 @@ fn resolve_hierarchy_captures(
     file_ids: &HashMap<String, u32>,
     name_to_global: &HashMap<&str, Vec<u32>>,
     sym_to_file_id: &[u32],
+    records: &[SymbolRecord],
 ) -> (
     Vec<super::hierarchy_edges::HierarchyEdgeBuilder>,
     Vec<super::unresolved_hierarchy::UnresolvedHierarchyEdgeBuilder>,
 ) {
     let mut resolved = Vec::new();
     let mut unresolved = Vec::new();
+    let is_type = |idx: u32| {
+        records.get(idx as usize).is_some_and(|record| {
+            matches!(
+                crate::index::symbols::SymbolKind::try_from(record.kind),
+                Ok(crate::index::symbols::SymbolKind::Struct
+                    | crate::index::symbols::SymbolKind::Class
+                    | crate::index::symbols::SymbolKind::Interface
+                    | crate::index::symbols::SymbolKind::Trait
+                    | crate::index::symbols::SymbolKind::Enum
+                    | crate::index::symbols::SymbolKind::TypeAlias)
+            )
+        })
+    };
 
     for file in parsed {
         if file.hierarchy_captures.is_empty() {
@@ -130,32 +142,38 @@ fn resolve_hierarchy_captures(
             let child_idx = name_to_global
                 .get(cap.child_name.as_str())
                 .and_then(|cands| {
-                    cands
-                        .iter()
-                        .copied()
-                        .find(|&idx| sym_to_file_id.get(idx as usize) == Some(&file_id))
+                    cands.iter().copied().find(|&idx| {
+                        (!file.path.ends_with(".dart") || is_type(idx))
+                            && sym_to_file_id.get(idx as usize) == Some(&file_id)
+                    })
                 });
             let Some(from_sym_idx) = child_idx else {
                 continue;
             };
 
-            match name_to_global.get(cap.parent_name.as_str()) {
-                Some(cands) if cands.len() == 1 => {
+            let mut parents = name_to_global
+                .get(cap.parent_name.as_str())
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&idx| !file.path.ends_with(".dart") || is_type(idx));
+            match (parents.next(), parents.next()) {
+                (Some(to_sym_idx), None) => {
                     resolved.push(super::hierarchy_edges::HierarchyEdgeBuilder {
-                        to_sym_idx: cands[0],
+                        to_sym_idx,
                         from_sym_idx,
                         from_file_id: file_id,
                         line: cap.line,
                         kind: cap.kind,
                     });
                 }
-                Some(_) => {
+                (Some(_), Some(_)) => {
                     // Ambiguous (>1 candidate) — bail on this edge, do
                     // not guess and do NOT spill (distinct outcome from
                     // zero-candidates). Matches the ref-edge Unresolved
                     // arm's single-candidate rule (writer.rs above).
                 }
-                None => {
+                (None, _) => {
                     // Zero candidates — external/stdlib parent. Spill by
                     // verbatim name, unconditionally (no meaningful-
                     // identifier gate — see unresolved_hierarchy.rs).
@@ -989,8 +1007,13 @@ fn write_index_to(
     // region is already sequential (no rayon risk) and only *reads*
     // `name_to_global` / `sym_to_file_id` — it cannot corrupt the ref-edge
     // resolution performed above.
-    let (hierarchy_edge_builders, unresolved_hierarchy_builders) =
-        resolve_hierarchy_captures(parsed, &file_ids, &name_to_global, &sym_to_file_id);
+    let (hierarchy_edge_builders, unresolved_hierarchy_builders) = resolve_hierarchy_captures(
+        parsed,
+        &file_ids,
+        &name_to_global,
+        &sym_to_file_id,
+        &records,
+    );
     let (hierarchy_edge_bytes, hierarchy_index_bytes, hierarchy_postings_bytes) =
         build_hierarchy_section(&hierarchy_edge_builders)?;
     let (
@@ -1678,6 +1701,57 @@ mod hierarchy_resolution_tests {
             }
         }
         panic!("symbol {name} not found in written index");
+    }
+
+    #[test]
+    fn hierarchy_resolves_types_when_constructor_symbols_come_first() {
+        let file = mk_file(
+            "a.dart",
+            vec![
+                mk_sym("Base", SymbolKind::Method, 2),
+                mk_sym("Base", SymbolKind::Class, 1),
+                mk_sym("Child", SymbolKind::Method, 4),
+                mk_sym("Child", SymbolKind::Class, 3),
+            ],
+            vec![HierarchyCapture {
+                child_name: "Child".into(),
+                parent_name: "Base".into(),
+                kind: EdgeKind::Extends as u8,
+                line: 3,
+            }],
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tmp.path().join("index.vex");
+        write_index(&[file], &out).unwrap();
+        let reader = IndexReader::open(&out).unwrap();
+        let edges = reader.find_hierarchy_edges_by_symbol(1);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from_sym_idx, 3);
+        assert!(reader.find_hierarchy_edges_by_symbol(0).is_empty());
+        assert_eq!(reader.symbol_count(), 4, "constructor records must survive");
+    }
+
+    #[test]
+    fn hierarchy_parent_with_only_nontype_candidates_spills() {
+        let file = mk_file(
+            "a.dart",
+            vec![
+                mk_sym("Base", SymbolKind::Function, 1),
+                mk_sym("Child", SymbolKind::Class, 2),
+            ],
+            vec![HierarchyCapture {
+                child_name: "Child".into(),
+                parent_name: "Base".into(),
+                kind: EdgeKind::Extends as u8,
+                line: 2,
+            }],
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tmp.path().join("index.vex");
+        write_index(&[file], &out).unwrap();
+        let reader = IndexReader::open(&out).unwrap();
+        assert!(!reader.has_hierarchy_edges());
+        assert_eq!(reader.find_unresolved_hierarchy_by_name("Base").len(), 1);
     }
 
     #[test]
