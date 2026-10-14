@@ -75,7 +75,20 @@ impl EmbedCache {
     /// caller doesn't need to distinguish — every failure mode just
     /// degrades to "no hits".
     pub fn load(path: &Path, embedder_id: &str, dim: u32) -> Self {
-        match Self::try_load(path, embedder_id, dim) {
+        Self::load_with_entry_limit(path, embedder_id, dim, MAX_ENTRIES)
+    }
+
+    /// Bounded query-cache read, using the same descriptor and header decoder
+    /// as the ordinary symbol cache. A replacement cannot enlarge the body
+    /// allocation beyond the caller's entry limit.
+    pub fn load_with_entry_limit(
+        path: &Path,
+        embedder_id: &str,
+        dim: u32,
+        max_entries: u32,
+    ) -> Self {
+        match Self::try_load_with_entry_limit(path, embedder_id, dim, max_entries.min(MAX_ENTRIES))
+        {
             Ok(cache) => cache,
             Err(e) => {
                 // Only log at debug — missing cache is the cold-start
@@ -90,7 +103,17 @@ impl EmbedCache {
         }
     }
 
+    #[cfg(test)]
     fn try_load(path: &Path, embedder_id: &str, dim: u32) -> Result<Self> {
+        Self::try_load_with_entry_limit(path, embedder_id, dim, MAX_ENTRIES)
+    }
+
+    fn try_load_with_entry_limit(
+        path: &Path,
+        embedder_id: &str,
+        dim: u32,
+        max_entries: u32,
+    ) -> Result<Self> {
         // Header first — magic, version, embedder_id, dim, entry_count — every
         // one validated before a single vector byte is read. The header is
         // variable-length (the id), so it comes off in three steps. The body
@@ -130,13 +153,18 @@ impl EmbedCache {
         // Cap to a sensible upper bound — 10M entries × ~1.5 KiB each
         // = 15 GB, which is past anything legitimate. Reject so an
         // adversarial entry_count can't OOM us on read.
-        if entry_count > MAX_ENTRIES {
+        if entry_count > max_entries {
             anyhow::bail!("entry_count absurd: {}", entry_count);
         }
 
         let vector_bytes = (dim as usize) * std::mem::size_of::<f32>();
         let header_bytes = 20 + id_len as u64;
-        let bytes = reader.finish(entry_count as u64 * (8 + vector_bytes as u64))?;
+        let body_bytes = entry_count as u64 * (8 + vector_bytes as u64);
+        let strict_size = max_entries < MAX_ENTRIES;
+        let bytes = reader.finish(body_bytes + u64::from(strict_size))?;
+        if strict_size && bytes.len() as u64 != header_bytes + body_bytes {
+            anyhow::bail!("bounded cache must contain exactly its declared records");
+        }
         let mut file = std::io::Cursor::new(bytes.as_slice());
         file.set_position(header_bytes);
 
@@ -271,6 +299,40 @@ fn read_u64<R: Read>(r: &mut R) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn query_entry_limit_rejects_multi_record_before_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("query.bin");
+        let mut cache = super::EmbedCache::empty("query", 384);
+        cache.insert(0, vec![1.0; 384]);
+        cache.insert(1, vec![1.0; 384]);
+        cache.save(&path).unwrap();
+        assert_eq!(super::EmbedCache::load(&path, "query", 384).len(), 2);
+        assert!(super::EmbedCache::load_with_entry_limit(&path, "query", 384, 1).is_empty());
+    }
+
+    #[test]
+    fn query_entry_limit_rejects_large_count_and_trailing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("query.bin");
+        let mut cache = super::EmbedCache::empty("query", 384);
+        cache.insert(0, vec![1.0; 384]);
+        cache.save(&path).unwrap();
+        let valid = std::fs::read(&path).unwrap();
+        let mut excess = valid.clone();
+        excess.push(0);
+        std::fs::write(&path, &excess).unwrap();
+        assert!(super::EmbedCache::load_with_entry_limit(&path, "query", 384, 1).is_empty());
+        assert_eq!(super::EmbedCache::load(&path, "query", 384).len(), 1);
+        let mut forged = valid;
+        forged[21..25].copy_from_slice(&10_000_000u32.to_le_bytes());
+        std::fs::write(&path, forged).unwrap();
+        let error = super::EmbedCache::try_load_with_entry_limit(&path, "query", 384, 1)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("entry_count absurd"), "{error}");
+    }
     use super::*;
     use tempfile::TempDir;
 
