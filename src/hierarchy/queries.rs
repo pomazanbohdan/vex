@@ -353,6 +353,24 @@ pub(super) fn inheritance_query(lang: Language) -> Option<&'static str> {
               (#match? @_m "^(include|extend|prepend)$")) @def
             "#,
         ),
+        Language::Dart => Some(
+            r#"
+            (class_definition name: (identifier) @child
+              superclass: (superclass (type_identifier) @base)) @def
+            (class_definition name: (identifier) @child
+              interfaces: (interfaces (type_identifier) @base)) @def
+            (class_definition name: (identifier) @child
+              superclass: (superclass (mixins (type_identifier) @base))) @def
+            (extension_type_declaration name: (identifier) @child
+              interfaces: (interfaces (type_identifier) @base)) @def
+            (enum_declaration name: (identifier) @child
+              (mixins (type_identifier) @base)) @def
+            (enum_declaration name: (identifier) @child
+              (interfaces (type_identifier) @base)) @def
+            (mixin_declaration (identifier) @child
+              (interfaces (type_identifier) @base)) @def
+            "#,
+        ),
         // Languages without class-hierarchy semantics in their grammar.
         // Go uses structural typing (no declared base list), SQL /
         // Markdown / config formats have no classes, Bash and Lua are
@@ -420,6 +438,9 @@ pub(super) const RUBY_MIXIN_PATTERN_START: usize = 1;
 pub(super) fn relation_label(lang: Language, pattern_index: usize) -> &'static str {
     match lang {
         Language::Rust => "impl",
+        Language::Dart if matches!(pattern_index, 2 | 4) => "uses",
+        Language::Dart if matches!(pattern_index, 1 | 3 | 5 | 6) => "implements",
+        Language::Dart => "extends",
         Language::Ruby if pattern_index >= RUBY_MIXIN_PATTERN_START => "include",
         Language::Ruby => "inherits",
         Language::Php if pattern_index >= PHP_TRAIT_PATTERN_START => "uses",
