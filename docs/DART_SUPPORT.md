@@ -67,6 +67,8 @@ and [SDK location converter](https://github.com/dart-lang/sdk/blob/3.13.5/pkg/an
 define this normalization and synthetic location.
 Strict Dart target selection compares full indexed names with the query using
 the FST's lowercase semantics; CamelCase subtoken postings do not add targets.
+When no exact definition matches, strict queries verify source freshness and
+return an empty result without starting the SDK or reporting compiler provenance.
 
 SDK discovery: explicit `VEX_DART_SDK` (SDK directory or Dart executable), then
 ancestor `.fvm/flutter_sdk`, ancestor `.fvmrc` version in the user's

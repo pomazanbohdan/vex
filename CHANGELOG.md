@@ -22,6 +22,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Keep the Dart Analysis Server cache outside application directories when Windows cache environment values are empty.
 - Include Dart `main` test entrypoints in `tests-for` after matching the test path; keep native and utility name filters.
+- Return empty strict results without an SDK when no exact Dart definition matches, while retaining source freshness checks and omitting compiler provenance.
 
 ## [1.27.4] - 2026-10-06
 

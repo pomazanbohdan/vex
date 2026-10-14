@@ -79,6 +79,37 @@ fn missing_dart_sdk_is_explicit_and_ordinary_search_still_works() {
 }
 
 #[test]
+fn absent_dart_definition_returns_empty_without_an_sdk() {
+    let root = project();
+    let output = command(root.path())
+        .env("VEX_DART_SDK", root.path().join("missing-sdk"))
+        .args(["usages", "AbsentDefinition", "--strict", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let data: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(data["results"].as_array().unwrap().is_empty());
+    assert!(data["_meta"].get("vex.dev/reference_backend").is_none());
+}
+
+#[test]
+fn absent_dart_definition_still_rejects_stale_source_without_an_sdk() {
+    let root = project();
+    std::fs::write(root.path().join("lib.dart"), "void AbsentDefinition() {}\n").unwrap();
+    command(root.path())
+        .env("VEX_DART_SDK", root.path().join("missing-sdk"))
+        .args(["usages", "AbsentDefinition", "--strict", "--no-stale-check"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("source hashes are stale"));
+}
+
+#[test]
 fn impact_shares_real_strict_backend_and_reports_provenance() {
     let Some(sdk) = sdk() else {
         return;
