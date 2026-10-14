@@ -22,6 +22,15 @@ pub enum Freshness {
 /// ls-files) to count changed files. When false, only compares HEAD — a single
 /// subprocess call.
 pub fn check(root: &Path, manifest: &Manifest, deep: bool) -> Freshness {
+    if !manifest.has_current_parse_revision()
+        && (manifest.indexed_at.is_some()
+            || manifest.git_head.is_some()
+            || !manifest.files.is_empty())
+    {
+        return Freshness::Stale {
+            changed_count: None,
+        };
+    }
     if let Some(ref saved_head) = manifest.git_head {
         if let Some(f) = check_git(root, saved_head, deep) {
             return f;
@@ -227,6 +236,7 @@ mod tests {
     fn stale_when_head_differs() {
         let manifest = Manifest {
             git_head: Some("0000000000000000000000000000000000000000".to_string()),
+            parse_revision: Some(crate::index::parse_cache::CACHE_FORMAT_VERSION),
             indexed_at: None,
             ..Default::default()
         };
@@ -247,6 +257,7 @@ mod tests {
         }
         let manifest = Manifest {
             git_head: head,
+            parse_revision: Some(crate::index::parse_cache::CACHE_FORMAT_VERSION),
             indexed_at: None,
             ..Default::default()
         };
@@ -265,6 +276,7 @@ mod tests {
         }
         let manifest = Manifest {
             git_head: head,
+            parse_revision: Some(crate::index::parse_cache::CACHE_FORMAT_VERSION),
             indexed_at: None,
             ..Default::default()
         };
@@ -274,6 +286,23 @@ mod tests {
             matches!(result, Freshness::Fresh | Freshness::Stale { .. }),
             "deep check should be Fresh or Stale, not Unknown"
         );
+    }
+
+    #[test]
+    fn indexed_manifest_without_current_parse_revision_is_stale() {
+        for parse_revision in [None, Some(5)] {
+            let manifest = Manifest {
+                files: [("src/lib.rs".to_string(), 1)].into(),
+                parse_revision,
+                ..Default::default()
+            };
+            assert!(matches!(
+                check(Path::new("."), &manifest, false),
+                Freshness::Stale {
+                    changed_count: None
+                }
+            ));
+        }
     }
 
     // ---- H11: content-hash verification of mtime-triggered stale signal ----

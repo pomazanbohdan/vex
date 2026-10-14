@@ -196,7 +196,9 @@ fn manifest_options_cover(manifest: &Manifest, opts: IndexOptions, embedder_id: 
 /// set) or by `vex index --no-clusters` is NOT skipped — the rebuild is
 /// owed so STALE clears and a real cluster section gets computed.
 fn run_can_skip(manifest: &Manifest, opts: IndexOptions, embedder_id: &str) -> bool {
-    if !manifest_options_cover(manifest, opts, embedder_id) {
+    if !manifest.has_current_parse_revision()
+        || !manifest_options_cover(manifest, opts, embedder_id)
+    {
         return false;
     }
     if opts.with_pattern_index && manifest.pattern_index_full == Some(false) {
@@ -208,47 +210,89 @@ fn run_can_skip(manifest: &Manifest, opts: IndexOptions, embedder_id: &str) -> b
     true
 }
 
-/// `update`-specific skip decision. Beyond the option-coverage check —
-/// `update` never produces `pattern_index_full == true`, so reusing a
-/// peer's partial pattern index is identical to what `update` itself
-/// would have emitted — this also refuses to skip when the on-disk
-/// index predates the current format (`docs/V9-FORMAT.md` §13 R5): an
-/// untouched v8 index must converge to v9 on the next `vex update`
-/// (including auto-update) rather than staying v8 forever just because
-/// nothing else changed. `clusters_full`/`run_can_skip`'s half of R5 is
-/// implemented in [`run_can_skip`] below, not this gate.
-///
-/// Opens the on-disk index **at most once** (code-review HIGH: the
-/// previous shape opened it twice on this hot path — once here for the
-/// version check, once more in the caller via `existing_symbol_count`
-/// on the skip-return branch). Returns:
-/// - `Ok(Some(symbol_count))` — skip is allowed; `symbol_count` is what
-///   the caller should report (0 when there is no index at all, matching
-///   `existing_symbol_count`'s old fallback).
-/// - `Ok(None)` — do not skip (manifest options don't cover the request,
-///   or the on-disk version is older than this build's `VERSION`).
-/// - `Err` — the index file exists but failed to open (corrupt). This
-///   must propagate so a corrupt index can never resolve to a silent
-///   skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UpdateState {
+    skip_symbol_count: Option<usize>,
+    force_full_semantic_rebuild: bool,
+}
+
+fn semantic_request_requires_full_rebuild(
+    manifest: &Manifest,
+    opts: IndexOptions,
+    embedder_id: &str,
+    reader: Option<&crate::store::reader::IndexReader>,
+) -> bool {
+    if !opts.with_embeddings {
+        return false;
+    }
+    if manifest.embedder_id.as_deref() != Some(embedder_id) {
+        return true;
+    }
+    let Some(reader) = reader else {
+        return true;
+    };
+    let Some(expected_dim) = crate::embed::embedder_dim(embedder_id) else {
+        return true;
+    };
+    let header = reader.header();
+    if header.vector_dim != expected_dim {
+        return true;
+    }
+
+    let vector_size =
+        u64::from(header.vector_dim).saturating_mul(std::mem::size_of::<f32>() as u64);
+    let vector_bytes = header.strings_offset.saturating_sub(header.vectors_offset);
+    let expected_bytes = (reader.symbol_count() as u64).saturating_mul(vector_size);
+    vector_bytes != expected_bytes
+}
+
+fn inspect_update_state(
+    manifest: &Manifest,
+    opts: IndexOptions,
+    embedder_id: &str,
+    root: &Path,
+    check_skip: bool,
+) -> Result<UpdateState> {
+    let skip_options_cover = check_skip
+        && manifest.has_current_parse_revision()
+        && manifest_options_cover(manifest, opts, embedder_id);
+    if !skip_options_cover && !opts.with_embeddings {
+        return Ok(UpdateState {
+            skip_symbol_count: None,
+            force_full_semantic_rebuild: false,
+        });
+    }
+    let index_path = config::index_path(root);
+    if !index_path.exists() {
+        let force_full_semantic_rebuild =
+            semantic_request_requires_full_rebuild(manifest, opts, embedder_id, None);
+        return Ok(UpdateState {
+            skip_symbol_count: (skip_options_cover && !force_full_semantic_rebuild).then_some(0),
+            force_full_semantic_rebuild,
+        });
+    }
+    let reader = crate::store::reader::IndexReader::open(&index_path)
+        .context("open existing index to check update eligibility")?;
+    let force_full_semantic_rebuild =
+        semantic_request_requires_full_rebuild(manifest, opts, embedder_id, Some(&reader));
+    let skip_symbol_count = (skip_options_cover
+        && reader.header().version >= crate::store::format::VERSION
+        && !force_full_semantic_rebuild)
+        .then(|| reader.symbol_count());
+    Ok(UpdateState {
+        skip_symbol_count,
+        force_full_semantic_rebuild,
+    })
+}
+
+#[cfg(test)]
 fn try_skip_update(
     manifest: &Manifest,
     opts: IndexOptions,
     embedder_id: &str,
     root: &Path,
 ) -> Result<Option<usize>> {
-    if !manifest_options_cover(manifest, opts, embedder_id) {
-        return Ok(None);
-    }
-    let index_path = config::index_path(root);
-    if !index_path.exists() {
-        return Ok(Some(0));
-    }
-    let reader = crate::store::reader::IndexReader::open(&index_path)
-        .context("open existing index to check update skip eligibility")?;
-    if reader.header().version < crate::store::format::VERSION {
-        return Ok(None);
-    }
-    Ok(Some(reader.symbol_count()))
+    Ok(inspect_update_state(manifest, opts, embedder_id, root, true)?.skip_symbol_count)
 }
 
 /// Full rebuild: index all files from scratch.
@@ -346,10 +390,19 @@ fn run_with_lock(
                 && diff.deleted.is_empty()
                 && run_can_skip(&current_manifest, opts, embedder_id)
             {
-                tracing::info!(
-                    "index already built by a concurrent vex instance; skipping rebuild"
-                );
-                return Ok((existing_symbol_count(root)?, false));
+                let reader = crate::store::reader::IndexReader::open(&index_path)
+                    .context("open existing index to check index eligibility")?;
+                if !semantic_request_requires_full_rebuild(
+                    &current_manifest,
+                    opts,
+                    embedder_id,
+                    Some(&reader),
+                ) {
+                    tracing::info!(
+                        "index already built by a concurrent vex instance; skipping rebuild"
+                    );
+                    return Ok((reader.symbol_count(), false));
+                }
             }
         }
     }
@@ -451,19 +504,6 @@ fn run_with_lock(
     Ok((symbol_count, true))
 }
 
-/// Symbol count of the existing on-disk index, or 0 if there is none. Shared by
-/// `update`'s early-return paths that skip a rebuild.
-fn existing_symbol_count(root: &Path) -> Result<usize> {
-    let index_path = config::index_path(root);
-    if index_path.exists() {
-        Ok(crate::store::reader::IndexReader::open(&index_path)
-            .context("open existing index for symbol count")?
-            .symbol_count())
-    } else {
-        Ok(0)
-    }
-}
-
 /// Incremental update: detect changed files, re-parse only those, merge with unchanged
 /// symbols from the existing index. Returns (total_symbols, changed_count, deleted_count).
 pub fn update(
@@ -542,6 +582,107 @@ fn build_old_table_from_records<'a>(
     Some(old_table)
 }
 
+struct MigrationVector {
+    symbol: crate::index::symbols::ParsedSymbol,
+    hash: u64,
+    vector: Option<Vec<f32>>,
+}
+
+struct MigratedFiles {
+    files: Vec<crate::index::symbols::ParsedFile>,
+    vectors: Vec<Vec<f32>>,
+}
+
+fn collect_migration_vectors(
+    reader: &crate::store::reader::IndexReader,
+    manifest: &Manifest,
+    changed: &HashSet<&str>,
+    body_tokens: Option<&[Option<String>]>,
+    hash_path: &Path,
+) -> Option<(String, HashMap<String, Vec<MigrationVector>>)> {
+    let id = manifest.embedder_id.as_deref()?;
+    if crate::embed::embedder_dim(id)? != reader.header().vector_dim {
+        return None;
+    }
+    crate::embed::embedder_char_budget(id)?;
+    let bodies = body_tokens?;
+    let hashes = crate::search::hash_index::load(hash_path).ok()?;
+    if bodies.len() != reader.symbol_count() || hashes.len() != reader.symbol_count() {
+        return None;
+    }
+
+    let mut files: HashMap<String, Vec<MigrationVector>> = HashMap::new();
+    for (i, &hash) in hashes.iter().enumerate() {
+        let record = reader.symbol(i)?;
+        let path = reader.read_string(record.file_offset);
+        if changed.contains(path) {
+            continue;
+        }
+        let signature = reader.read_string(record.signature_offset);
+        let symbol = crate::index::symbols::ParsedSymbol {
+            name: reader.read_string(record.name_offset).to_string(),
+            kind: crate::index::symbols::SymbolKind::try_from(record.kind).ok()?,
+            line: record.line as usize,
+            signature: (!signature.is_empty()).then(|| signature.to_string()),
+            doc: None,
+            body_tokens: bodies[i].clone(),
+        };
+        files
+            .entry(path.to_string())
+            .or_default()
+            .push(MigrationVector {
+                symbol,
+                hash,
+                vector: reader.vector(record.vector_index).map(<[f32]>::to_vec),
+            });
+    }
+    Some((id.to_string(), files))
+}
+
+fn reuse_migration_vectors(
+    fresh_files: Vec<crate::index::symbols::ParsedFile>,
+    embedder_id: &str,
+    mut old_files: HashMap<String, Vec<MigrationVector>>,
+) -> Result<MigratedFiles> {
+    let mut retained = Vec::new();
+    let mut unembedded = Vec::new();
+    let mut vectors = Vec::new();
+    for fresh in fresh_files {
+        let hashes = compute_hashes_for(std::slice::from_ref(&fresh), embedder_id)?;
+        let old = old_files.remove(&fresh.path);
+        let matches = old.as_ref().is_some_and(|old| {
+            old.len() == fresh.symbols.len()
+                && old
+                    .iter()
+                    .zip(&fresh.symbols)
+                    .zip(&hashes)
+                    .all(|((old, fresh), hash)| {
+                        old.symbol.name == fresh.name
+                            && old.symbol.kind == fresh.kind
+                            && old.symbol.line == fresh.line
+                            && old.symbol.signature == fresh.signature
+                            && old.symbol.body_tokens == fresh.body_tokens
+                            && old.hash == *hash
+                            && old
+                                .vector
+                                .as_ref()
+                                .is_some_and(|vector| vector.iter().all(|value| value.is_finite()))
+                    })
+        });
+        if matches {
+            vectors.extend(old.into_iter().flatten().filter_map(|old| old.vector));
+            retained.push(fresh);
+        } else {
+            unembedded.push(fresh);
+        }
+    }
+    retained.extend(unembedded);
+    Ok(MigratedFiles {
+        files: retained,
+        vectors,
+    })
+}
+
 fn update_inner(
     root: &Path,
     opts: IndexOptions,
@@ -581,7 +722,8 @@ fn update_inner(
     // structural-only index would early-return and silently leave the
     // embedder request unfulfilled.
     if diff.changed.is_empty() && diff.deleted.is_empty() {
-        if let Some(symbol_count) = try_skip_update(&old_manifest, opts, embedder_id, &root)? {
+        let state = inspect_update_state(&old_manifest, opts, embedder_id, &root, true)?;
+        if let Some(symbol_count) = state.skip_symbol_count {
             tracing::info!(unchanged = diff.unchanged, "nothing to update");
             return Ok(Some((symbol_count, 0, 0)));
         }
@@ -615,12 +757,13 @@ fn update_inner(
         let diff = manifest::diff_files(&hashed.hashes, &current_manifest);
         (diff, current_manifest)
     };
-    if diff.changed.is_empty() && diff.deleted.is_empty() {
-        if let Some(symbol_count) = try_skip_update(&current_manifest, opts, embedder_id, &root)? {
-            tracing::info!("index refreshed by a concurrent vex instance; skipping rebuild");
-            return Ok(Some((symbol_count, 0, 0)));
-        }
+    let can_skip = diff.changed.is_empty() && diff.deleted.is_empty();
+    let state = inspect_update_state(&current_manifest, opts, embedder_id, &root, can_skip)?;
+    if let Some(symbol_count) = state.skip_symbol_count {
+        tracing::info!("index refreshed by a concurrent vex instance; skipping rebuild");
+        return Ok(Some((symbol_count, 0, 0)));
     }
+    let force_full_semantic_reparse = state.force_full_semantic_rebuild;
 
     tracing::info!(
         changed = diff.changed.len(),
@@ -630,6 +773,9 @@ fn update_inner(
     );
 
     let mut changed_set: HashSet<&str> = diff.changed.iter().map(|s| s.as_str()).collect();
+    if !current_manifest.has_current_parse_revision() || force_full_semantic_reparse {
+        changed_set.extend(hashed.hashes.iter().map(|(path, _)| path.as_str()));
+    }
     let deleted_set: HashSet<&str> = diff.deleted.iter().map(|s| s.as_str()).collect();
 
     // === Cascade-then-reconstruct ordering invariant ===========================
@@ -811,9 +957,25 @@ fn update_inner(
             None
         }
     };
+    let mut migration_vectors = None;
     let (unchanged_parsed, unchanged_vectors, mut artefacts) = if index_path.exists() {
         let reader = crate::store::reader::IndexReader::open(&index_path)
             .context("open existing index for incremental merge")?;
+        if !current_manifest.has_current_parse_revision() && !opts.with_embeddings {
+            let changed: HashSet<&str> = diff
+                .changed
+                .iter()
+                .chain(&diff.deleted)
+                .map(String::as_str)
+                .collect();
+            migration_vectors = collect_migration_vectors(
+                &reader,
+                &current_manifest,
+                &changed,
+                body_tokens_sidecar.as_deref(),
+                &config::hash_index_path(&root),
+            );
+        }
         // P4b (`docs/V9-FORMAT.md` §13 R11) — built from THIS `reader`,
         // the same one handed to `reconstruct_unchanged` two lines below
         // and to the old-symbols-by-path / old-table extraction further
@@ -1005,9 +1167,27 @@ fn update_inner(
     all_parsed.extend(newly_parsed);
     let symbol_count: usize = all_parsed.iter().map(|f| f.symbols.len()).sum();
 
-    let unchanged_count = unchanged_vectors.len();
+    let mut unchanged_count = unchanged_vectors.len();
     let mut all_vectors = unchanged_vectors;
     all_vectors.extend(new_vectors);
+    let mut retained_embedder = None;
+    if let Some((id, old_files)) = migration_vectors {
+        let migrated = reuse_migration_vectors(all_parsed, &id, old_files)?;
+        all_parsed = migrated.files;
+        all_vectors = migrated.vectors;
+        unchanged_count = all_vectors.len();
+        if !all_vectors.is_empty() {
+            retained_embedder = Some(id);
+        }
+    }
+    let semantic_embedder_id = if opts.with_embeddings {
+        embedder_id
+    } else {
+        retained_embedder
+            .as_deref()
+            .or(current_manifest.embedder_id.as_deref())
+            .unwrap_or(embedder_id)
+    };
     // v1.13 P5: normalize the merged set so the result is always
     // L2-normalized regardless of legacy state. Key subtlety: when the
     // existing index is ALREADY normalized (v1.13+), re-normalizing
@@ -1027,12 +1207,14 @@ fn update_inner(
         }
     }
 
-    let manifest_embedder = if opts.with_embeddings && !all_vectors.is_empty() {
-        Some(embedder_id.to_string())
-    } else {
+    let manifest_embedder = if all_vectors.is_empty() {
         None
+    } else if opts.with_embeddings || retained_embedder.is_some() {
+        Some(semantic_embedder_id.to_string())
+    } else {
+        current_manifest.embedder_id.clone()
     };
-    let vector_dim = vector_dim_for(embedder_id, &all_vectors);
+    let vector_dim = vector_dim_for(semantic_embedder_id, &all_vectors);
     write_output_locked(
         &root,
         &all_parsed,
@@ -1045,8 +1227,8 @@ fn update_inner(
         &artefacts,
     )?;
 
-    if !all_vectors.is_empty() {
-        let all_hashes = compute_hashes_for(&all_parsed, embedder_id)?;
+    if !all_vectors.is_empty() && all_vectors.len() == symbol_count {
+        let all_hashes = compute_hashes_for(&all_parsed, semantic_embedder_id)?;
         // v1.15.0 B1.2: try the incremental HNSW path first.
         //   Ok(true)  — incremental applied; HNSW + hash-index sidecar
         //               on disk in post-update state. SKIP full rebuild.
@@ -1070,8 +1252,8 @@ fn update_inner(
         // `unchanged + newly_parsed`, NOT just `_new_hashes` from
         // generate_embeddings (that would evict every unchanged
         // symbol's cache entry and defeat the cache on the next run).
-        let dim = vector_dim_for(embedder_id, &all_vectors);
-        let _ = prune_embed_cache(&root, embedder_id, dim, &all_hashes);
+        let dim = vector_dim_for(semantic_embedder_id, &all_vectors);
+        let _ = prune_embed_cache(&root, semantic_embedder_id, dim, &all_hashes);
     } else {
         // Same paired cleanup as the full-rebuild path — drop both
         // sidecars together so the next `vex search --semantic` gets

@@ -15,6 +15,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`cargo binstall vex-search` / `vex-search-mcp`** download the prebuilt
   release binaries instead of compiling.
 
+
+### Fixed
+
+- **Incremental updates retain ordinary references from unchanged files.**
+  Reference-only files, duplicate same-line occurrences and remapped file IDs
+  now survive repeated changes and deletions. Existing affected indexes are
+  reparsed once while verified semantic vectors and their HNSW index are kept.
+- **Semantic rebuilds repair incomplete vector coverage.** `index` and `update`
+  re-embed every live symbol when stored vectors are partial, use another
+  dimension, or belong to another embedder.
+- **Strict usages resolve the exact requested symbol name.** Camel-case FST
+  subtokens no longer merge `DerivedService` edges into a `Service` query, and
+  hierarchy edges ignore same-named non-type symbols such as constructors.
+- **Semantic HNSW results preserve identical-context aliases.** Every symbol
+  sharing a stored hash remains visible, post-filter limits are filled, and a
+  mismatched graph/sidecar pair falls back to brute-force search.
+- **Call-graph traversal preserves same-named result sites.** `reachable` and
+  `tests-for` emit each distinct path and line while expanding shared names
+  once, and fixture expansion retains same-named helpers across test files.
+
 ## [1.27.4] - 2026-10-06
 
 ### Fixed

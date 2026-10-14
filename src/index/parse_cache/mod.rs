@@ -57,7 +57,7 @@ use crate::store::pattern_skeletons::grammar_fingerprint_for_lang;
 /// Magic bytes at the start of every cache file.
 pub const MAGIC: &[u8; 4] = b"VXBC";
 
-/// Bump this whenever `ParsedFile` (or any type it embeds) changes shape.
+/// Bump this whenever `ParsedFile` changes shape or extraction semantics.
 /// Stale entries with a different version are silently ignored.
 ///
 /// History:
@@ -84,7 +84,7 @@ pub const MAGIC: &[u8; 4] = b"VXBC";
 ///   fields on a struct-shape change like this. Treating v4 as a miss
 ///   forces a one-time re-parse, after which v5 entries carry
 ///   `hierarchy_captures` for free on every hit.
-pub const CACHE_FORMAT_VERSION: u16 = 5;
+pub const CACHE_FORMAT_VERSION: u16 = 6;
 
 /// On-disk header size: 4 (magic) + 2 (version) + 4 (fingerprint).
 const HEADER_SIZE: usize = 10;

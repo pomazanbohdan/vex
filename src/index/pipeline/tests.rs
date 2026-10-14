@@ -5,6 +5,13 @@ use std::collections::HashMap;
 use super::*;
 use crate::parse::language::Language;
 
+fn current_manifest() -> Manifest {
+    Manifest {
+        parse_revision: Some(crate::index::parse_cache::CACHE_FORMAT_VERSION),
+        ..Manifest::default()
+    }
+}
+
 #[test]
 fn grammar_failure_summary_includes_language_count_and_reason() {
     // Pin the structured fields the user-visible warning emits, so a future
@@ -29,7 +36,27 @@ fn grammar_failure_summary_includes_language_count_and_reason() {
 fn manifest_with_embedder(id: Option<&str>) -> Manifest {
     Manifest {
         embedder_id: id.map(|s| s.to_string()),
-        ..Manifest::default()
+        ..current_manifest()
+    }
+}
+
+#[test]
+fn stale_parse_revision_blocks_index_and_update_skip_paths() {
+    let opts = IndexOptions {
+        with_clusters: false,
+        ..IndexOptions::default()
+    };
+    let root = std::path::Path::new("/nonexistent-vex-revision-test-root");
+    for parse_revision in [None, Some(5)] {
+        let manifest = Manifest {
+            parse_revision,
+            ..Manifest::default()
+        };
+        assert!(!run_can_skip(&manifest, opts, "minilm-l6-v2"));
+        assert_eq!(
+            try_skip_update(&manifest, opts, "minilm-l6-v2", root).unwrap(),
+            None
+        );
     }
 }
 
@@ -106,7 +133,7 @@ fn run_refuses_to_skip_partial_pattern_index_when_caller_opted_in() {
     };
     let m = Manifest {
         pattern_index_full: Some(false),
-        ..Manifest::default()
+        ..current_manifest()
     };
     assert!(!run_can_skip(&m, opts, "minilm-l6-v2"));
 }
@@ -123,7 +150,7 @@ fn run_accepts_full_or_pre_flag_pattern_index() {
     };
     let full = Manifest {
         pattern_index_full: Some(true),
-        ..Manifest::default()
+        ..current_manifest()
     };
     assert!(run_can_skip(&full, opts, "minilm-l6-v2"));
 
@@ -132,7 +159,7 @@ fn run_accepts_full_or_pre_flag_pattern_index() {
     // The Manifest doc treats `None` as conservative (i.e. *not* full),
     // but the skip gate only blocks on an explicit `Some(false)` written
     // by `vex update`; that is the precise scenario the gate exists for.
-    let pre_flag = Manifest::default();
+    let pre_flag = current_manifest();
     assert!(run_can_skip(&pre_flag, opts, "minilm-l6-v2"));
 }
 
@@ -148,7 +175,7 @@ fn run_ignores_pattern_index_full_when_caller_did_not_ask_for_pattern_index() {
     };
     let m = Manifest {
         pattern_index_full: Some(false),
-        ..Manifest::default()
+        ..current_manifest()
     };
     assert!(run_can_skip(&m, opts, "minilm-l6-v2"));
 }
@@ -168,7 +195,7 @@ fn run_refuses_to_skip_when_clusters_wanted_but_not_computed() {
     for clusters_full in [Some(false), None] {
         let m = Manifest {
             clusters_full,
-            ..Manifest::default()
+            ..current_manifest()
         };
         assert!(
             !run_can_skip(&m, opts, "minilm-l6-v2"),
@@ -186,7 +213,7 @@ fn run_accepts_a_manifest_with_computed_clusters() {
     };
     let m = Manifest {
         clusters_full: Some(true),
-        ..Manifest::default()
+        ..current_manifest()
     };
     assert!(run_can_skip(&m, opts, "minilm-l6-v2"));
 }
@@ -201,7 +228,7 @@ fn run_ignores_clusters_full_when_caller_passed_no_clusters() {
     };
     let m = Manifest {
         clusters_full: Some(false),
-        ..Manifest::default()
+        ..current_manifest()
     };
     assert!(run_can_skip(&m, opts, "minilm-l6-v2"));
 }
@@ -221,7 +248,7 @@ fn update_skip_ignores_clusters_full_entirely() {
     };
     let m = Manifest {
         clusters_full: Some(false),
-        ..Manifest::default()
+        ..current_manifest()
     };
     let no_index_root = std::path::Path::new("/nonexistent-vex-update-clusters-skip-test-root");
     assert_eq!(
@@ -281,13 +308,12 @@ fn update_skip_is_strictly_options_cover() {
         pattern_index_full: Some(false),
         ..manifest_with_embedder(Some("minilm-l6-v2"))
     };
-    // No index exists at this path — `try_skip_update` treats a missing
-    // index as "no version gate to apply, skip with a reported count of
-    // 0" (matches pre-R5 behaviour for this options-only check).
+    // A semantic request cannot skip when the index needed to verify vector
+    // coverage is missing.
     let no_index_root = std::path::Path::new("/nonexistent-vex-update-skip-test-root");
     assert_eq!(
         try_skip_update(&m, opts, "minilm-l6-v2", no_index_root).unwrap(),
-        Some(0)
+        None
     );
 
     // But embedder mismatch still blocks skip.

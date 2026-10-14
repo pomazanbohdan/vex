@@ -20,7 +20,9 @@ use anyhow::Result;
 use rayon::prelude::*;
 
 use crate::index::hasher;
-use crate::index::symbols::{HierarchyCapture, ParsedFile, ParsedSymbol, RawCallEdge, SymbolKind};
+use crate::index::symbols::{
+    HierarchyCapture, ParsedFile, ParsedRef, ParsedSymbol, RawCallEdge, SymbolKind,
+};
 use crate::index::types::{ReconstructedRef, ReconstructedUnresolvedRef};
 use crate::parse;
 use crate::parse::language::Language;
@@ -110,9 +112,31 @@ pub(super) fn reconstruct_unchanged(
     }
     let has_vectors = reader.has_vectors();
     let mut vectors: Vec<Vec<f32>> = Vec::new();
-    let mut parsed_files: Vec<ParsedFile> = Vec::new();
-    let mut current_path = String::new();
-    let mut current_symbols: Vec<ParsedSymbol> = Vec::new();
+    let old_file_paths = reader.file_paths();
+    let old_file_id_by_path: HashMap<&str, u32> = old_file_paths
+        .iter()
+        .enumerate()
+        .map(|(file_id, path)| (path.as_str(), file_id as u32))
+        .collect();
+    let mut parsed_files: Vec<ParsedFile> = Vec::with_capacity(old_file_paths.len());
+    let mut parsed_index_by_old_file = vec![None; old_file_paths.len()];
+    for (old_file_id, path) in old_file_paths.iter().enumerate() {
+        if changed.contains(path.as_str()) || deleted.contains(path.as_str()) {
+            continue;
+        }
+        parsed_index_by_old_file[old_file_id] = Some(parsed_files.len());
+        parsed_files.push(ParsedFile {
+            path: path.clone(),
+            symbols: Vec::new(),
+            refs: Vec::new(),
+            call_edges: Vec::new(),
+            bound_refs: Vec::new(),
+            skeletons: Vec::new(),
+            cpp_includes: Vec::new(),
+            trigram_bloom: None,
+            hierarchy_captures: Vec::new(),
+        });
+    }
     // P4b (`docs/V9-FORMAT.md` §13 R11) — built next to `current_symbols`
     // below, NOT derived from `unchanged_count` (that counts *vectors*,
     // §13 R11's must-fix, and is 0 without embeddings).
@@ -165,31 +189,16 @@ pub(super) fn reconstruct_unchanged(
             }
             continue;
         }
-        let path = path_str.to_string();
-
-        // Flush previous file group when path changes
-        if path != current_path && !current_path.is_empty() {
-            parsed_files.push(ParsedFile {
-                path: std::mem::take(&mut current_path),
-                symbols: std::mem::take(&mut current_symbols),
-                refs: Vec::new(),
-                call_edges: Vec::new(),
-                bound_refs: Vec::new(),
-                skeletons: Vec::new(),
-                cpp_includes: Vec::new(),
-                // Reconstructed from a prior index — no bytes read, so no
-                // fresh bloom. The sidecar writer carries the old record
-                // forward for this path (see output.rs trigram block).
-                trigram_bloom: None,
-                // Placeholder — overwritten below (P2a carry-forward
-                // block) for files that had hierarchy edges in the OLD
-                // index. Left empty here because that block runs after
-                // every `ParsedFile` has been assembled and needs the
-                // final `path` to look up the OLD file_id.
-                hierarchy_captures: Vec::new(),
-            });
-        }
-        current_path = path;
+        let Some(&old_file_id) = old_file_id_by_path.get(path_str) else {
+            tracing::warn!(
+                file = path_str,
+                "symbol path is absent from the old file table"
+            );
+            continue;
+        };
+        let Some(parsed_index) = parsed_index_by_old_file[old_file_id as usize] else {
+            continue;
+        };
 
         let name = reader.read_string(rec.name_offset).to_string();
         // Skip records whose name decoded to "" — that's the signal
@@ -198,7 +207,7 @@ pub(super) fn reconstruct_unchanged(
         // the symbol on the next rebuild and silently shrink the index.
         if name.is_empty() {
             tracing::warn!(
-                file = %current_path,
+                file = path_str,
                 line = rec.line,
                 name_offset = rec.name_offset,
                 "reconstruct_unchanged: dropping symbol with empty/corrupt name — \
@@ -221,7 +230,7 @@ pub(super) fn reconstruct_unchanged(
             .cloned()
             .flatten();
 
-        current_symbols.push(ParsedSymbol {
+        parsed_files[parsed_index].symbols.push(ParsedSymbol {
             name,
             kind,
             line: rec.line as usize,
@@ -245,20 +254,17 @@ pub(super) fn reconstruct_unchanged(
         }
     }
 
-    // Flush last file group
-    if !current_path.is_empty() {
-        parsed_files.push(ParsedFile {
-            path: current_path,
-            symbols: current_symbols,
-            refs: Vec::new(),
-            call_edges: Vec::new(),
-            bound_refs: Vec::new(),
-            skeletons: Vec::new(),
-            cpp_includes: Vec::new(),
-            // Reconstructed — see the flush block above.
-            trigram_bloom: None,
-            // Placeholder — see the per-flush comment above.
-            hierarchy_captures: Vec::new(),
+    if let Some(ref_reader) = reader.ref_reader() {
+        ref_reader.for_each(|name, entry| {
+            let Some(Some(parsed_index)) = parsed_index_by_old_file.get(entry.file_id as usize)
+            else {
+                return;
+            };
+            parsed_files[*parsed_index].refs.push(ParsedRef {
+                name: name.to_string(),
+                line: entry.line as usize,
+                context: None,
+            });
         });
     }
 
@@ -303,7 +309,6 @@ pub(super) fn reconstruct_unchanged(
     // an almost-empty result set after the first incremental update.
     // Mirror of the call_edges block above (uses old-index strings, lets
     // the writer's second pass re-resolve to NEW symbol indices).
-    let old_file_paths = reader.file_paths();
     let mut reconstructed_refs: Vec<ReconstructedRef> = Vec::new();
     if reader.has_ref_edges() {
         // Path/name interners — dedupe Arc<str> across edges sharing
@@ -518,15 +523,6 @@ pub(super) fn reconstruct_unchanged(
         }
 
         if !resolved_by_file.is_empty() || !unresolved_by_file.is_empty() {
-            // OLD path -> OLD file_id, built once (not per-file / per-edge)
-            // so the per-file lookup below is O(1) instead of an O(files)
-            // linear scan over `old_file_paths` for every unchanged file.
-            let old_file_id_by_path: HashMap<&str, u32> = old_file_paths
-                .iter()
-                .enumerate()
-                .map(|(fid, path)| (path.as_str(), fid as u32))
-                .collect();
-
             for pf in &mut parsed_files {
                 // changed/deleted files never reach `parsed_files` in this
                 // function (filtered at the top of the main loop), so no
@@ -1247,5 +1243,137 @@ mod hierarchy_carry_forward_tests {
 
         assert_eq!(recon.parsed_files.len(), 1);
         assert!(recon.parsed_files[0].hierarchy_captures.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod refs_carry_forward_tests {
+    use super::*;
+    use crate::store::reader::IndexReader;
+    use crate::store::writer::write_index_full;
+
+    fn file(path: &str, symbols: Vec<ParsedSymbol>, refs: Vec<ParsedRef>) -> ParsedFile {
+        ParsedFile {
+            path: path.to_string(),
+            symbols,
+            refs,
+            call_edges: Vec::new(),
+            bound_refs: Vec::new(),
+            skeletons: Vec::new(),
+            cpp_includes: Vec::new(),
+            trigram_bloom: None,
+            hierarchy_captures: Vec::new(),
+        }
+    }
+
+    fn symbol(name: &str) -> ParsedSymbol {
+        ParsedSymbol {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            line: 1,
+            signature: None,
+            doc: None,
+            body_tokens: None,
+        }
+    }
+
+    fn reference(name: &str, line: usize) -> ParsedRef {
+        ParsedRef {
+            name: name.to_string(),
+            line,
+            context: None,
+        }
+    }
+
+    #[test]
+    fn reconstruct_unchanged_preserves_reference_only_files_and_multiplicity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first.vex");
+        write_index_full(
+            &[
+                file(
+                    "deleted.py",
+                    vec![symbol("Removed")],
+                    vec![reference("Removed", 2)],
+                ),
+                file(
+                    "refs_only.py",
+                    Vec::new(),
+                    vec![
+                        reference("Config", 7),
+                        reference("Config", 7),
+                        reference("Config", 8),
+                    ],
+                ),
+                file(
+                    "changed.rs",
+                    vec![symbol("changed")],
+                    vec![reference("Stale", 3)],
+                ),
+            ],
+            &[],
+            384,
+            &first,
+        )
+        .unwrap();
+
+        let reader = IndexReader::open(&first).unwrap();
+        let changed = HashSet::from(["changed.rs"]);
+        let deleted = HashSet::from(["deleted.py"]);
+        let mut reconstructed =
+            reconstruct_unchanged(&reader, &changed, &deleted, None, None).parsed_files;
+        assert_eq!(reconstructed.len(), 1);
+        assert_eq!(reconstructed[0].path, "refs_only.py");
+        assert!(reconstructed[0].symbols.is_empty());
+        assert_eq!(
+            reconstructed[0]
+                .refs
+                .iter()
+                .map(|r| (r.name.as_str(), r.line))
+                .collect::<Vec<_>>(),
+            [("Config", 7), ("Config", 7), ("Config", 8)]
+        );
+
+        reconstructed.push(file(
+            "changed.rs",
+            vec![symbol("changed")],
+            vec![reference("Fresh", 11)],
+        ));
+        let second = tmp.path().join("second.vex");
+        write_index_full(&reconstructed, &[], 384, &second).unwrap();
+        let second_reader = IndexReader::open(&second).unwrap();
+        assert_eq!(second_reader.file_paths(), ["refs_only.py", "changed.rs"]);
+        assert_eq!(
+            second_reader
+                .ref_reader()
+                .unwrap()
+                .find("Config")
+                .iter()
+                .map(|entry| (entry.file_id, entry.line))
+                .collect::<Vec<_>>(),
+            [(0, 7), (0, 7), (0, 8)]
+        );
+        assert!(second_reader.ref_reader().unwrap().find("Stale").is_empty());
+        assert_eq!(
+            second_reader.ref_reader().unwrap().find("Fresh")[0].file_id,
+            1
+        );
+
+        let third_files =
+            reconstruct_unchanged(&second_reader, &HashSet::new(), &HashSet::new(), None, None)
+                .parsed_files;
+        let third = tmp.path().join("third.vex");
+        write_index_full(&third_files, &[], 384, &third).unwrap();
+        let third_reader = IndexReader::open(&third).unwrap();
+        assert_eq!(
+            third_reader
+                .ref_reader()
+                .unwrap()
+                .find("Config")
+                .iter()
+                .map(|entry| (entry.file_id, entry.line))
+                .collect::<Vec<_>>(),
+            [(0, 7), (0, 7), (0, 8)]
+        );
     }
 }
