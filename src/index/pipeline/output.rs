@@ -719,6 +719,7 @@ pub(super) fn write_output_locked(
         files: hashed.hashes.iter().cloned().collect::<HashMap<_, _>>(),
         git_head,
         indexed_at: Some(indexed_at),
+        parse_revision: Some(crate::index::parse_cache::CACHE_FORMAT_VERSION),
         embedder_id,
         // Persist explicit `Some(false)` for opt-outs so `vex update`
         // can detect them. `Some(true)` rather than `None` for the
@@ -1742,29 +1743,6 @@ pub fn build_hnsw_at(
         .reserve(vectors.len())
         .context("reserve HNSW capacity")?;
 
-    // v1.15.1: dedup on hash key before HNSW insert ONLY. `context_hash`
-    // collapses (kind, name, path, signature, doc, body_tokens) into a
-    // u64 without a byte-offset disambiguator (see `compute_hashes_for`
-    // above), so two C++ symbols with identical signatures in the same
-    // file (forward decl + def, overloads, anonymous-namespace clones)
-    // produce the same key. usearch's high-level `Index::add` opens
-    // with `multi: false` and treats a duplicate key as a hard error,
-    // which — pre-fix — aborted the whole index build mid-corpus and
-    // left no on-disk HNSW. We keep the first occurrence (skip-and-warn)
-    // so a single collision can't bring down the semantic channel.
-    //
-    // The on-disk hash sidecar stays sym_idx-aligned (full `hashes`
-    // slice, duplicates and all) — `src/search/semantic.rs:156` checks
-    // `hashes.len() == expected_symbols` at query open and bails to
-    // brute force if they disagree. The reader at the same site already
-    // dedups duplicate hashes via `entry().or_insert` (keeps first
-    // sym_idx, logs `collisions` count), so the duplicate-symbol case
-    // is handled end-to-end without dropping any record from the index.
-    // Single `first_idx: HashMap<u64, usize>` maps each hash to the
-    // sym_idx of its FIRST occurrence — `entry().or_insert(i)` collapses
-    // the "have we seen this hash?" check and the "what was the first
-    // sym_idx?" lookup into one operation, so the warn log never needs
-    // a fallback for a missing key.
     let mut first_idx: std::collections::HashMap<u64, usize> =
         std::collections::HashMap::with_capacity(hashes.len());
     let mut inserted: usize = 0;
@@ -1920,17 +1898,17 @@ pub fn build_hnsw_incremental_at(
     // = 10M; `10M * 4` = 40M, well within `usize::MAX` even on 32-bit
     // targets (4G). No `checked_mul` needed under that invariant.
     if to_remove.len() * INCREMENTAL_TOMBSTONE_DENOMINATOR
-        > old_hashes.len() * INCREMENTAL_TOMBSTONE_NUMERATOR
+        > old_set.len() * INCREMENTAL_TOMBSTONE_NUMERATOR
     {
         // Threshold-exceeded is an expected performance-tuning event,
         // not an error — log at `debug` so it doesn't spam RUST_LOG=info
         // output during normal large-refactor runs.
         tracing::debug!(
             removed = to_remove.len(),
-            old_size = old_hashes.len(),
+            old_size = old_set.len(),
             "HNSW incremental: tombstone threshold exceeded ({}/{} > {}/{}) → full rebuild",
             to_remove.len(),
-            old_hashes.len(),
+            old_set.len(),
             INCREMENTAL_TOMBSTONE_NUMERATOR,
             INCREMENTAL_TOMBSTONE_DENOMINATOR,
         );
@@ -1971,12 +1949,12 @@ pub fn build_hnsw_incremental_at(
         return Ok(false);
     }
 
-    // Reserve up-front for the post-mutation size so usearch doesn't
-    // re-grow its arena mid-loop. `to_add_indices.len() + old_size`
-    // is the upper bound; once we remove the orphans the real size is
-    // `new_vectors.len()`, but over-reserving is cheap and avoids the
-    // off-by-one of computing it before `remove()` runs.
-    let post_capacity = old_hashes.len() + to_add_indices.len();
+    if !crate::search::hash_index::matches_hnsw(&index, dim, old_set.iter()) {
+        tracing::warn!("HNSW incremental: dimension/key-set mismatch → full rebuild");
+        return Ok(false);
+    }
+
+    let post_capacity = old_set.len() + new_set.difference(&old_set).count();
     if let Err(e) = index.reserve(post_capacity) {
         tracing::warn!(error = %e, "HNSW incremental: reserve failed → full rebuild");
         return Ok(false);
@@ -1984,13 +1962,12 @@ pub fn build_hnsw_incremental_at(
 
     let removed_count = to_remove.len();
     for h in &to_remove {
-        // `remove` returns the count of points removed. Zero is the
-        // "key not present" path — defensive but expected if the
-        // sidecar drifted from the HNSW. Swallow rather than bail; the
-        // worst case is a stale tombstone that the next compaction
-        // (full rebuild) sweeps.
-        if let Err(e) = index.remove(*h) {
-            tracing::debug!(hash = h, error = %e, "HNSW incremental: remove key error (ignored)");
+        if !matches!(index.remove(*h), Ok(1)) {
+            tracing::warn!(
+                hash = h,
+                "HNSW incremental: remove key failed → full rebuild"
+            );
+            return Ok(false);
         }
     }
 
@@ -2037,6 +2014,11 @@ pub fn build_hnsw_incremental_at(
                 added_count += 1;
             }
         }
+    }
+
+    if !crate::search::hash_index::matches_hnsw(&index, dim, new_set.iter()) {
+        tracing::warn!("HNSW incremental: post-update key-set mismatch → full rebuild");
+        return Ok(false);
     }
 
     // v1.15.0 C — two-phase atomic commit. Same `commit_hnsw_and_sidecar`
@@ -2343,7 +2325,9 @@ mod tests {
 
         // Query with v_foo — top-1 must be sym_idx 0 with similarity
         // ~1.0 (the stored vector under hash h_foo).
-        let results = handle.search(&v_foo, 1).expect("search succeeds");
+        let results = handle
+            .search_with_aliases(&v_foo, 1)
+            .expect("search succeeds");
         assert_eq!(results.len(), 1);
         let (sym_idx, sim) = results[0];
         assert_eq!(sym_idx, 0, "top-1 must resolve to sym_idx 0 via hash map");
@@ -2351,6 +2335,108 @@ mod tests {
     }
 
     // ---- v1.15.0 B1.2 incremental HNSW tests ----
+
+    #[test]
+    fn incremental_alias_add_change_delete_preserves_remaining_symbols() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vectors = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ];
+        let (path, hashes) = make_seed_hnsw(&tmp, &[11, 11, 22, 33, 44], &vectors);
+        let mut new_vectors = vectors[1..].to_vec();
+        assert!(
+            build_hnsw_incremental_at(&path, &hashes, &new_vectors, &[11, 22, 33, 44]).unwrap()
+        );
+        {
+            let handle = crate::search::semantic::HnswHandle::open(&path, 4, 4).unwrap();
+            assert_eq!(handle.search_with_aliases(&vectors[0], 1).unwrap()[0].0, 0);
+        }
+        new_vectors.insert(1, vectors[0].clone());
+        new_vectors.push(vectors[2].clone());
+        assert!(
+            build_hnsw_incremental_at(&path, &hashes, &new_vectors, &[11, 11, 22, 33, 44, 55])
+                .unwrap()
+        );
+        {
+            let handle = crate::search::semantic::HnswHandle::open(&path, 4, 6)
+                .expect("added alias must not force brute force");
+            assert_eq!(
+                handle
+                    .search_with_aliases(&vectors[0], 1)
+                    .unwrap()
+                    .iter()
+                    .map(|r| r.0)
+                    .collect::<Vec<_>>(),
+                [0, 1]
+            );
+        }
+        new_vectors[1] = vectors[3].clone();
+        assert!(
+            build_hnsw_incremental_at(&path, &hashes, &new_vectors, &[11, 66, 22, 33, 44, 55])
+                .unwrap()
+        );
+        let handle = crate::search::semantic::HnswHandle::open(&path, 4, 6).unwrap();
+        assert_eq!(handle.search_with_aliases(&vectors[0], 1).unwrap()[0].0, 0);
+        assert!(handle
+            .search_with_aliases(&vectors[3], 2)
+            .unwrap()
+            .iter()
+            .any(|r| r.0 == 1 && r.1 > 0.99));
+        assert_eq!(
+            crate::search::hash_index::load(&hashes).unwrap(),
+            [11, 66, 22, 33, 44, 55]
+        );
+    }
+
+    #[test]
+    fn incremental_rejects_same_size_stale_keys_and_dimension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let (path, hashes) = make_seed_hnsw(&tmp, &[11, 22], &vectors);
+        assert!(!build_hnsw_incremental_at(
+            &path,
+            &hashes,
+            &[vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]],
+            &[11, 22]
+        )
+        .unwrap());
+        crate::search::hash_index::save(&hashes, &[11, 33]).unwrap();
+        assert!(!build_hnsw_incremental_at(&path, &hashes, &vectors, &[11, 33]).unwrap());
+    }
+
+    #[test]
+    fn incremental_tombstone_ratio_counts_unique_vectors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vectors = vec![vec![1.0, 0.0]; 9]
+            .into_iter()
+            .chain([vec![0.0, 1.0]])
+            .collect::<Vec<_>>();
+        let hashes = vec![11; 9].into_iter().chain([22]).collect::<Vec<_>>();
+        let (path, sidecar) = make_seed_hnsw(&tmp, &hashes, &vectors);
+        assert!(
+            !build_hnsw_incremental_at(&path, &sidecar, &vectors[..9], &hashes[..9]).unwrap(),
+            "one of two unique vectors removed exceeds 25 percent"
+        );
+    }
+
+    #[test]
+    fn incremental_stale_same_cardinality_pair_falls_back_without_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let (path, sidecar) = make_seed_hnsw(&tmp, &[11, 22], &vectors);
+        crate::search::hash_index::save(&sidecar, &[11, 33]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(!build_hnsw_incremental_at(&path, &sidecar, &vectors, &[11, 33]).unwrap());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "fallback must preserve old graph"
+        );
+    }
 
     /// Build a fixture HNSW with two synthetic vectors, then add/remove
     /// via the incremental path and verify the query still works. The
@@ -2491,12 +2577,16 @@ mod tests {
         // be sym_idx 1 (sidecar position of h_seed[1]).
         let handle = crate::search::semantic::HnswHandle::open(&hnsw_path, dim, h_new.len())
             .expect("open handle");
-        let results = handle.search(&v_seed[1], 1).expect("search v_seed[1]");
+        let results = handle
+            .search_with_aliases(&v_seed[1], 1)
+            .expect("search v_seed[1]");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 1, "surviving old vector at new sym_idx 1");
 
         // Query for the freshly-added vector: top-1 must be sym_idx 4.
-        let results = handle.search(&v_added, 1).expect("search v_added");
+        let results = handle
+            .search_with_aliases(&v_added, 1)
+            .expect("search v_added");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 4, "freshly-added vector at new sym_idx 4");
     }

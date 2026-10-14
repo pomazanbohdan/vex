@@ -40,6 +40,18 @@ const VERSION: u32 = 1;
 /// reader bails before allocating against a crafted count.
 const MAX_COUNT: u32 = 10_000_000;
 
+pub(crate) fn matches_hnsw<'a>(
+    index: &usearch::Index,
+    expected_dim: usize,
+    mut unique_hashes: impl ExactSizeIterator<Item = &'a u64>,
+) -> bool {
+    index.dimensions() == expected_dim
+        && matches!(index.metric_kind(), usearch::MetricKind::Cos)
+        && index.size() > 0
+        && index.size() == unique_hashes.len()
+        && unique_hashes.all(|&hash| index.count(hash) == 1)
+}
+
 /// Atomic save: write to `.tmp`, then rename. Matches the convention
 /// used by `embed::cache::EmbedCache::save` and `store::writer` —
 /// half-written sidecars can't be mistaken for valid ones.

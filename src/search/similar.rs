@@ -245,7 +245,7 @@ fn per_symbol_duplicate_candidates(
     };
 
     let scored = nearest_neighbors(reader, query_vec, neighbors_per_sym, hnsw, normalized);
-    let mut out = Vec::with_capacity(scored.len());
+    let mut out = Vec::with_capacity(scored.len().min(neighbors_per_sym));
     for (other_idx, sim) in scored {
         if other_idx == sym_idx {
             continue;
@@ -260,30 +260,33 @@ fn per_symbol_duplicate_candidates(
             continue;
         }
         out.push((sim, sym_idx, other_idx));
+        if out.len() == neighbors_per_sym {
+            break;
+        }
     }
     out
 }
 
 /// Run HNSW (if available) or brute-force nearest-neighbor search.
 ///
-/// Returns up to `top_k` `(symbol_index, cosine_similarity)` pairs sorted
-/// descending by similarity. Self may be included — callers filter it out.
 fn nearest_neighbors(
     reader: &IndexReader,
     query_vec: &[f32],
-    top_k: usize,
+    candidate_limit: usize,
     hnsw: Option<&semantic::HnswHandle>,
     normalized: bool,
 ) -> Vec<(usize, f32)> {
     if let Some(handle) = hnsw {
-        if let Some(scored) = handle.search(query_vec, top_k) {
+        let distinct_hash_limit = candidate_limit;
+        if let Some(scored) = handle.search_with_aliases(query_vec, distinct_hash_limit) {
             return scored;
         }
-        // search() returned None — usearch internal error. Fall through
-        // to brute-force rather than returning empty.
+        // search_with_aliases() returned None — usearch internal error.
+        // Fall through to brute-force rather than returning empty.
     }
 
     // Brute-force fallback.
+    let symbol_limit = candidate_limit;
     let mut scored: Vec<(usize, f32)> = Vec::new();
     for i in 0..reader.symbol_count() {
         if let Some(rec) = reader.symbol(i) {
@@ -298,7 +301,7 @@ fn nearest_neighbors(
         }
     }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(top_k);
+    scored.truncate(symbol_limit);
     scored
 }
 
@@ -396,4 +399,77 @@ pub(crate) fn build_match(
         signature,
         similarity,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::symbols::{ParsedFile, ParsedSymbol};
+
+    #[test]
+    fn duplicate_candidates_apply_budget_after_alias_filters() {
+        const COUNT: usize = 16;
+        const BUDGET: usize = 6;
+        let tmp = tempfile::tempdir().unwrap();
+        let hnsw_path = tmp.path().join("index.hnsw");
+        let index_path = tmp.path().join("index.vex");
+        let vectors = vec![vec![1.0, 0.0]; COUNT];
+        let parsed = vec![ParsedFile {
+            path: "aliases.rs".into(),
+            symbols: (0..COUNT)
+                .map(|idx| ParsedSymbol {
+                    name: "repeat".into(),
+                    kind: SymbolKind::Function,
+                    line: idx * 10 + 1,
+                    signature: None,
+                    doc: None,
+                    body_tokens: None,
+                })
+                .collect(),
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(&parsed, &vectors, 2, &index_path).unwrap();
+        crate::index::pipeline::build_hnsw_at(
+            &hnsw_path,
+            &tmp.path().join("index.hashes"),
+            &vectors,
+            &[11; COUNT],
+        )
+        .unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        let handle = semantic::HnswHandle::open(&hnsw_path, 2, COUNT).unwrap();
+        assert_eq!(
+            handle
+                .search_with_aliases(&vectors[0], BUDGET)
+                .unwrap()
+                .len(),
+            COUNT
+        );
+
+        let mut body_lines = vec![10; COUNT];
+        body_lines[..8].fill(1);
+        let retained = per_symbol_duplicate_candidates(
+            COUNT - 1,
+            &reader,
+            &body_lines,
+            Some(&handle),
+            BUDGET,
+            0.99,
+            2,
+            true,
+        );
+        assert_eq!(retained.len(), BUDGET);
+        assert!(retained.capacity() <= BUDGET);
+        assert_eq!(retained[0].2, 8);
+        assert!(retained.iter().all(|r| r.1 != r.2));
+
+        let pairs = find_duplicates(&reader, &hnsw_path, 0.99, 2, 1, true).unwrap();
+        assert_eq!(pairs.len(), 1);
+    }
 }

@@ -44,7 +44,7 @@
 //! ```text
 //! offset  size  field
 //!      0     4  magic = b"VXBC"
-//!      4     2  CACHE_FORMAT_VERSION: u16 (little-endian; 5 since hierarchy-edges P2)
+//!      4     2  CACHE_FORMAT_VERSION: u16 (little-endian; 6 since refs recovery)
 //!      6     4  grammar_fingerprint: u32 (little-endian)
 //!     10     1  trigram_bloom_present: u8
 //!     11   256  trigram_bloom slot
@@ -84,16 +84,14 @@ use vex::store::pattern_skeletons::grammar_fingerprint_for_lang;
 // updating this const silently turns the corrupt-payload test into a
 // version-mismatch test (the version gate fires before payload decode).
 const MAGIC: &[u8; 4] = b"VXBC";
-// Bumped 4 -> 5 alongside `parse_cache::CACHE_FORMAT_VERSION` for the
-// hierarchy-edges P2 `ParsedFile.hierarchy_captures` field addition.
-const CACHE_FORMAT_VERSION: u16 = 5;
+const CACHE_FORMAT_VERSION: u16 = 6;
 /// Width of the trigram-bloom slot that follows the 1-byte `present` flag.
 const BLOOM_SLOT_LEN: usize = 256;
 
 /// Write a format-correct current-version header (magic + version +
 /// fingerprint + `present = 0` + zeroed bloom slot) so a following payload
 /// is decoded at the right offset. Used by the hand-built cache-file tests.
-fn write_v4_header<W: std::io::Write>(f: &mut W, fingerprint: u32) {
+fn write_current_header<W: std::io::Write>(f: &mut W, fingerprint: u32) {
     f.write_all(MAGIC).unwrap();
     f.write_all(&CACHE_FORMAT_VERSION.to_le_bytes()).unwrap();
     f.write_all(&fingerprint.to_le_bytes()).unwrap();
@@ -474,7 +472,7 @@ fn blob_cache_lookup_with_stale_format_version_returns_none() {
 
     let sha = "cafebabecafebabecafebabecafebabecafebabe";
     // Shard directory: first two chars of sha.
-    let shard_dir = root.join("blobs").join(&sha[..2]);
+    let shard_dir = root.join(&sha[..2]);
     fs::create_dir_all(&shard_dir).unwrap();
     let cache_file = shard_dir.join(format!("{sha}.bin"));
 
@@ -512,15 +510,13 @@ fn blob_cache_lookup_with_corrupt_payload_returns_none() {
     let root = tmp.path().canonicalize().unwrap();
 
     let sha = "deadd00ddeadd00ddeadd00ddeadd00ddeadd00d";
-    let shard_dir = root.join("blobs").join(&sha[..2]);
+    let shard_dir = root.join(&sha[..2]);
     fs::create_dir_all(&shard_dir).unwrap();
     let cache_file = shard_dir.join(format!("{sha}.bin"));
 
-    // Valid v4 header (so the version + length gates pass and we actually
-    // reach payload decoding), then a random garbage payload.
     let fingerprint = grammar_fingerprint_for_lang(Language::Rust);
     let mut f = fs::File::create(&cache_file).unwrap();
-    write_v4_header(&mut f, fingerprint);
+    write_current_header(&mut f, fingerprint);
     // Truncated / garbage payload — bincode will fail to decode.
     f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
     drop(f);
@@ -571,9 +567,32 @@ fn blob_cache_lookup_rejects_stale_v4_entry_missing_hierarchy_captures() {
     let result = cache.lookup(sha, Language::Rust);
     assert!(
         result.is_none(),
-        "a v4 entry must version-miss under CACHE_FORMAT_VERSION 5, not be \
+        "a v4 entry must version-miss under CACHE_FORMAT_VERSION 6, not be \
          mis-deserialized as a (shorter) ParsedFile"
     );
+}
+
+#[test]
+fn blob_cache_lookup_rejects_pre_refs_recovery_v5_entry() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let sha = "5555555555555555555555555555555555555555";
+    let shard_dir = root.join(&sha[..2]);
+    fs::create_dir_all(&shard_dir).unwrap();
+    let cache_file = shard_dir.join(format!("{sha}.bin"));
+
+    let fingerprint = grammar_fingerprint_for_lang(Language::Rust);
+    let mut f = fs::File::create(&cache_file).unwrap();
+    f.write_all(MAGIC).unwrap();
+    f.write_all(&5u16.to_le_bytes()).unwrap();
+    f.write_all(&fingerprint.to_le_bytes()).unwrap();
+    f.write_all(&[0u8]).unwrap();
+    f.write_all(&[0u8; BLOOM_SLOT_LEN]).unwrap();
+    f.write_all(&bincode::serialize(&make_rich_parsed_file()).unwrap())
+        .unwrap();
+    drop(f);
+
+    assert!(BlobCache::new(root).lookup(sha, Language::Rust).is_none());
 }
 
 // ── Test 7: evict_to_cap removes oldest entries ───────────────────────────────
@@ -617,7 +636,7 @@ fn blob_cache_evict_to_cap_removes_oldest_entries() {
         };
         let payload = bincode::serialize(&pf).expect("serialize");
         let mut f = fs::File::create(&path).unwrap();
-        write_v4_header(&mut f, fingerprint);
+        write_current_header(&mut f, fingerprint);
         f.write_all(&payload).unwrap();
         path
     };
@@ -701,7 +720,7 @@ fn blob_cache_evict_to_cap_under_cap_is_noop() {
     };
     let payload = bincode::serialize(&pf).expect("serialize");
     let mut f = fs::File::create(&path).unwrap();
-    write_v4_header(&mut f, fingerprint);
+    write_current_header(&mut f, fingerprint);
     f.write_all(&payload).unwrap();
     drop(f);
 

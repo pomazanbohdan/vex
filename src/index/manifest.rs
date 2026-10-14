@@ -36,6 +36,11 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexed_at: Option<u64>,
 
+    /// Parse/extraction revision used to build every indexed file. Missing on
+    /// older manifests, forcing a one-time reparse even when hashes match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_revision: Option<u16>,
+
     /// Stable identifier of the embedder used to build the semantic index
     /// (e.g. `"minilm-l6-v2"`). `None` when the index has no embeddings, or
     /// for pre-9.1 manifests that did not record this field — readers
@@ -192,6 +197,10 @@ pub struct HistoryStats {
 }
 
 impl Manifest {
+    pub fn has_current_parse_revision(&self) -> bool {
+        self.parse_revision == Some(crate::index::parse_cache::CACHE_FORMAT_VERSION)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -692,6 +701,7 @@ mod tests {
         let json = serde_json::to_string(&Manifest::default()).unwrap();
         for key in [
             "git_head",
+            "parse_revision",
             "embedder_id",
             "call_graph",
             "bm25",
@@ -724,6 +734,22 @@ mod tests {
         let json = serde_json::to_string(&populated).unwrap();
         assert!(json.contains("\"call_graph\":false"), "got: {json}");
         assert!(json.contains("\"bm25\":true"), "got: {json}");
+    }
+
+    #[test]
+    fn parse_revision_is_backward_compatible_and_versioned() {
+        let legacy: Manifest = serde_json::from_str(r#"{"files":{"src/lib.rs":7}}"#).unwrap();
+        assert_eq!(legacy.parse_revision, None);
+        assert!(!legacy.has_current_parse_revision());
+
+        let current = Manifest {
+            parse_revision: Some(crate::index::parse_cache::CACHE_FORMAT_VERSION),
+            ..Manifest::default()
+        };
+        assert!(current.has_current_parse_revision());
+        assert!(serde_json::to_string(&current)
+            .unwrap()
+            .contains("\"parse_revision\":6"));
     }
 
     #[test]
