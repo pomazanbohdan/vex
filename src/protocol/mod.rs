@@ -168,6 +168,12 @@ impl Signals {
 
 #[derive(Serialize, Default, Clone, Debug)]
 pub struct MetaEnvelope {
+    /// Provenance for live compiler-resolved strict references.
+    #[serde(
+        rename = "vex.dev/reference_backend",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reference_backend: Option<serde_json::Value>,
     #[serde(
         rename = "vex.dev/index_age_ms",
         skip_serializing_if = "Option::is_none"

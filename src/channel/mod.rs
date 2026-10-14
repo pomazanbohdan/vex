@@ -48,6 +48,9 @@ use crate::cli::scope::PathScope;
 use crate::store::reader::IndexReader;
 use crate::util::paths::to_rel_posix;
 
+mod dart;
+mod dart_server;
+
 /// Cap on rows surfaced in each channel's `sample`. Verdict only
 /// needs `≥1 vs 0` granularity; the sample exists so the agent can
 /// see *where* the hits are without re-running a per-channel query.
@@ -104,6 +107,8 @@ pub struct DropCounts {
 /// `--why` trace.
 #[derive(Debug)]
 pub struct ChannelOutput {
+    /// Semantic backend provenance; absent for persisted native binder edges.
+    pub backend: Option<serde_json::Value>,
     pub available: bool,
     pub unavailable_reason: Option<String>,
     /// Raw fetch count for THIS channel's domain, before any
@@ -127,6 +132,7 @@ pub struct ChannelOutput {
 impl ChannelOutput {
     pub fn unavailable(reason: &str) -> Self {
         Self {
+            backend: None,
             available: false,
             unavailable_reason: Some(reason.to_string()),
             pre_filter_count: 0,
@@ -142,6 +148,8 @@ impl ChannelOutput {
 /// part of the v1 envelope contract.
 #[derive(Debug, Serialize)]
 pub struct ChannelResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<serde_json::Value>,
     /// `false` when the channel could not run (e.g. the index lacks
     /// the requisite section). Verdict logic treats `available:
     /// false` as informationless — an unavailable binder channel
@@ -170,6 +178,7 @@ impl ChannelResult {
     #[cfg(test)]
     pub fn unavailable(reason: &str) -> Self {
         Self {
+            backend: None,
             available: false,
             unavailable_reason: Some(reason.to_string()),
             count: 0,
@@ -188,6 +197,7 @@ impl ChannelResult {
         let truncated = count > SAMPLE_LIMIT;
         hits.truncate(SAMPLE_LIMIT);
         Self {
+            backend: None,
             available: true,
             unavailable_reason: None,
             count,
@@ -202,6 +212,7 @@ impl ChannelResult {
     pub fn from_output(out: ChannelOutput) -> Self {
         if !out.available {
             return Self {
+                backend: out.backend,
                 available: false,
                 unavailable_reason: out.unavailable_reason,
                 count: 0,
@@ -214,6 +225,7 @@ impl ChannelResult {
         let mut sample = out.hits;
         sample.truncate(SAMPLE_LIMIT);
         Self {
+            backend: out.backend,
             available: true,
             unavailable_reason: None,
             count,
@@ -315,10 +327,16 @@ pub fn build_def_sites<'a>(
     symbol: &str,
 ) -> HashMap<&'a str, HashSet<u32>> {
     let mut map: HashMap<&'a str, HashSet<u32>> = HashMap::new();
+    let full_dart_name = symbol.to_lowercase();
     if let Some(sym_fst) = reader.symbol_fst_reader() {
         for sym_idx in sym_fst.find(symbol) {
             if let Some(sym) = reader.symbol(sym_idx as usize) {
                 let file_path: &str = reader.read_string(sym.file_offset);
+                if file_path.ends_with(".dart")
+                    && reader.read_string(sym.name_offset).to_lowercase() != full_dart_name
+                {
+                    continue;
+                }
                 map.entry(file_path).or_default().insert(sym.line);
             }
         }
@@ -460,10 +478,10 @@ pub fn derive_verdict(invocations: &[ChannelInvocation]) -> (Verdict, String) {
 
 // ───────────────────────── Channel implementations ────────────────────────
 
-/// Phase 11.1 v5 `reference_edges` — binder-resolved cross-file refs.
-/// Available for Rust / TypeScript / Python / C# / C++ / Go / Java / Kotlin; reports
-/// `unavailable` on pre-v1.8 indexes or projects in languages
-/// without a binder.
+/// Native v5 `reference_edges` plus live Dart Analysis Server references.
+/// Native edges cover Rust / TypeScript / Python / C# / C++ / Go / Java / Kotlin;
+/// Dart requires an available SDK and fresh project source. Unsupported domains
+/// report unavailable rather than substituting textual references.
 pub struct StrictRefsChannel;
 
 impl Channel for StrictRefsChannel {
@@ -474,7 +492,22 @@ impl Channel for StrictRefsChannel {
         ChannelTier::Binder
     }
     fn run(&self, ctx: &ChannelContext<'_>) -> Result<ChannelOutput> {
+        let dart_result = if dart::has_dart(ctx) {
+            match dart::run(ctx) {
+                Ok((hits, backend)) => Some(dart::output(hits, ctx, backend)),
+                Err(err) => {
+                    return Ok(ChannelOutput::unavailable(&format!(
+                        "Dart strict backend unavailable: {err:#}"
+                    )))
+                }
+            }
+        } else {
+            None
+        };
         if !ctx.reader.has_ref_edges() {
+            if let Some(result) = dart_result {
+                return Ok(result);
+            }
             return Ok(ChannelOutput::unavailable(
                 "index has no v5 reference_edges section (pre-v1.8 index, or no binder coverage \
                  for this project's languages) — re-run `vex index` to rebuild",
@@ -491,7 +524,16 @@ impl Channel for StrictRefsChannel {
         let mut hits = Vec::new();
         let mut pre_filter_count = 0usize;
         let mut dropped = DropCounts::default();
+        let dart_name = dart_result.as_ref().map(|_| ctx.symbol.to_lowercase());
         for sym_idx in sym_fst.find(ctx.symbol) {
+            if let Some(name) = &dart_name {
+                let Some(symbol) = ctx.reader.symbol(sym_idx as usize) else {
+                    continue;
+                };
+                if ctx.reader.read_string(symbol.name_offset).to_lowercase() != *name {
+                    continue;
+                }
+            }
             for edge in ctx.reader.find_ref_edges_by_symbol(sym_idx) {
                 pre_filter_count += 1;
                 let path = ctx
@@ -509,7 +551,18 @@ impl Channel for StrictRefsChannel {
                 });
             }
         }
+        let backend = dart_result
+            .as_ref()
+            .and_then(|result| result.backend.clone());
+        if let Some(result) = dart_result {
+            pre_filter_count += result.pre_filter_count;
+            dropped.scope += result.dropped.scope;
+            hits.extend(result.hits);
+            hits.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+            hits.dedup_by(|a, b| a.path == b.path && a.line == b.line);
+        }
         Ok(ChannelOutput {
+            backend,
             available: true,
             unavailable_reason: None,
             pre_filter_count,
@@ -574,6 +627,7 @@ impl Channel for FstRefsChannel {
             });
         }
         Ok(ChannelOutput {
+            backend: None,
             available: true,
             unavailable_reason: None,
             pre_filter_count,
@@ -632,6 +686,7 @@ impl Channel for GrepWordBoundaryChannel {
             hits.push(HitLocation { path: posix, line });
         }
         Ok(ChannelOutput {
+            backend: None,
             available: true,
             unavailable_reason: None,
             pre_filter_count,
@@ -684,6 +739,7 @@ impl Channel for CallGraphCallersChannel {
             hits.push(HitLocation { path: m.path, line });
         }
         Ok(ChannelOutput {
+            backend: None,
             available: true,
             unavailable_reason: None,
             pre_filter_count,
@@ -767,6 +823,7 @@ impl Channel for TransitiveCallersChannel {
             hits.push(HitLocation { path: m.path, line });
         }
         Ok(ChannelOutput {
+            backend: None,
             available: true,
             unavailable_reason: None,
             pre_filter_count,

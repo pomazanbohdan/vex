@@ -907,7 +907,7 @@ fn default_cache_root() -> PathBuf {
 }
 
 /// Platform cache base, without the `vex` suffix.
-fn platform_cache_base() -> PathBuf {
+pub(crate) fn platform_cache_base() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = home_dir() {

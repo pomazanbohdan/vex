@@ -234,8 +234,6 @@ mod tests {
     /// pattern-skeleton grammar fingerprints, …).
     #[test]
     fn all_slice_covers_every_variant() {
-        // Every `lang_id` is in `1..=20` (slot 0 reserved for "not
-        // fingerprinted"), so the slice must have the same count.
         assert_eq!(Language::ALL.len(), 20);
         // `lang_id` is also our canonical ordinal; the slice must list
         // each one exactly once.
