@@ -34,6 +34,7 @@ use crate::workspace;
 /// reproduces the v1.20.x bail conditions (no refs / `--strict` on a
 /// pre-v5 index) without aborting a workspace fanout mid-loop.
 struct UsagesOutcome {
+    backend: Option<serde_json::Value>,
     available: bool,
     unavailable_reason: Option<String>,
     entries: Vec<HitLocation>,
@@ -155,6 +156,7 @@ pub(crate) fn usages(
                 .map(|h| serde_json::json!({ "path": h.path, "line": h.line }))
                 .collect();
             let mut meta = super::output::default_meta_for(&root);
+            meta.reference_backend = outcome.backend.clone();
             meta.diff_filter = diff_filter_meta(
                 &diff,
                 outcome.changed_paths.as_ref(),
@@ -173,6 +175,12 @@ pub(crate) fn usages(
             print_envelope(&json, capabilities::current(), meta);
         }
         OutputFormat::Text | OutputFormat::Compact => {
+            if let Some(backend) = &outcome.backend {
+                eprintln!(
+                    "Dart strict: Analysis Server {}, live source verified, {} ms",
+                    backend["protocol_version"], backend["elapsed_ms"]
+                );
+            }
             if outcome.entries.is_empty() {
                 println!("No usages found for \"{name}\"");
                 if let Some(prefix_results) = outcome.prefix_suggestions.as_deref() {
@@ -307,7 +315,14 @@ fn usages_from_reader(
     };
 
     if !output.available {
-        let reason = if strict {
+        let reason = if strict
+            && output
+                .unavailable_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("Dart strict backend unavailable"))
+        {
+            output.unavailable_reason.clone().unwrap_or_default()
+        } else if strict {
             format!(
                 "--strict needs a v5 index with reference_edges (this index is v{} or has no resolved refs). Re-run `vex index` to rebuild.",
                 reader.header().version
@@ -316,6 +331,7 @@ fn usages_from_reader(
             "no refs in index — re-run `vex index` to rebuild".to_string()
         };
         return Ok(UsagesOutcome {
+            backend: output.backend,
             available: false,
             unavailable_reason: Some(reason),
             entries: Vec::new(),
@@ -373,6 +389,7 @@ fn usages_from_reader(
     };
 
     Ok(UsagesOutcome {
+        backend: output.backend,
         available: true,
         unavailable_reason: None,
         entries,
@@ -585,6 +602,9 @@ fn render_workspace_json(
                 "total": r.outcome.total,
                 "usages": usages,
             });
+            if let Some(backend) = &r.outcome.backend {
+                obj["reference_backend"] = backend.clone();
+            }
             if !r.outcome.available {
                 obj["unavailable"] = serde_json::json!(r.outcome.unavailable_reason);
             }

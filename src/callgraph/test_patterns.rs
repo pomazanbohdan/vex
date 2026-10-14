@@ -71,6 +71,10 @@ pub(crate) fn looks_like_test_name(name: &str) -> bool {
         || name.ends_with("Tests")
 }
 
+pub(crate) fn is_test_entry_name(name: &str, path: &str) -> bool {
+    looks_like_test_name(name) || (name == "main" && path.ends_with(".dart"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +189,14 @@ mod tests {
         assert!(looks_like_test_name("FooTests"));
         assert!(!looks_like_test_name("fixture_helper"));
         assert!(!looks_like_test_name("helper"));
+    }
+
+    #[test]
+    fn dart_entry_name_preserves_native_and_utility_filters() {
+        assert!(is_test_entry_name("main", "sample_test.dart"));
+        assert!(is_test_entry_name("main", "integration_test/flow.dart"));
+        assert!(!is_test_entry_name("setupFixture", "sample_test.dart"));
+        assert!(!is_test_entry_name("main", "tests/integration.rs"));
+        assert!(is_test_entry_name("test_foo", "tests/integration.rs"));
     }
 }

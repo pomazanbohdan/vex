@@ -9,7 +9,7 @@ which grammar version each release ships against.
 
 ## Version matrix
 
-Last verified: **2026-10-03** (vex 1.27.1).
+Last verified: **2026-10-14** (Dart/Orchard branch).
 
 | Language | Extensions | Grammar crate | Grammar version | Symbol kinds extracted | `implementations` |
 |---|---|---|---|---|---|
@@ -32,10 +32,16 @@ Last verified: **2026-10-03** (vex 1.27.1).
 | HTML       | `.html`, `.htm`                         | `tree-sitter-html`        | 0.23 | `id` attribute values (as constants), custom-element tag names (hyphenated) | — |
 | YAML       | `.yaml`, `.yml`                         | `tree-sitter-yaml`        | 0.7  | document-root mapping keys (top-level only) | — |
 | TOML       | `.toml`                                 | `tree-sitter-toml-ng`     | 0.7  | table headers (`[name]`, `[[name]]`), key/value pairs | — |
+| Dart       | `.dart`                                 | `tree-sitter-dart-orchard` | =0.7.0 | class, enum, mixin, named extension, extension type, function, method, constructor, type alias, enum constant, import URI | ✅ `extends`, `implements`, `with` |
 
 Tree-sitter core itself is currently pinned at `0.26`. The grammar version
 column lists the crate's caret range from `Cargo.toml`; the locked patch
 version is in `Cargo.lock`.
+
+Dart has AST-filtered textual refs and name-based call edges. It has no scope
+binder for `vex usages --strict` and does not resolve receiver types or imported
+Dart library identities. See [Dart support](DART_SUPPORT.md) for extraction and
+grammar boundaries.
 
 ## How extension → language mapping works
 

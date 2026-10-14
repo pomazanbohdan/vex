@@ -1695,6 +1695,57 @@ mod hierarchy_resolution_tests {
     }
 
     #[test]
+    fn hierarchy_resolves_types_when_constructor_symbols_come_first() {
+        let file = mk_file(
+            "a.dart",
+            vec![
+                mk_sym("Base", SymbolKind::Method, 2),
+                mk_sym("Base", SymbolKind::Class, 1),
+                mk_sym("Child", SymbolKind::Method, 4),
+                mk_sym("Child", SymbolKind::Class, 3),
+            ],
+            vec![HierarchyCapture {
+                child_name: "Child".into(),
+                parent_name: "Base".into(),
+                kind: EdgeKind::Extends as u8,
+                line: 3,
+            }],
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tmp.path().join("index.vex");
+        write_index(&[file], &out).unwrap();
+        let reader = IndexReader::open(&out).unwrap();
+        let edges = reader.find_hierarchy_edges_by_symbol(1);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from_sym_idx, 3);
+        assert!(reader.find_hierarchy_edges_by_symbol(0).is_empty());
+        assert_eq!(reader.symbol_count(), 4, "constructor records must survive");
+    }
+
+    #[test]
+    fn dart_hierarchy_parent_with_only_nontype_candidates_spills() {
+        let file = mk_file(
+            "a.dart",
+            vec![
+                mk_sym("Base", SymbolKind::Function, 1),
+                mk_sym("Child", SymbolKind::Class, 2),
+            ],
+            vec![HierarchyCapture {
+                child_name: "Child".into(),
+                parent_name: "Base".into(),
+                kind: EdgeKind::Extends as u8,
+                line: 2,
+            }],
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tmp.path().join("index.vex");
+        write_index(&[file], &out).unwrap();
+        let reader = IndexReader::open(&out).unwrap();
+        assert!(!reader.has_hierarchy_edges());
+        assert_eq!(reader.find_unresolved_hierarchy_by_name("Base").len(), 1);
+    }
+
+    #[test]
     fn hierarchy_resolves_types_when_same_named_methods_come_first() {
         let file = mk_file(
             "a.rs",

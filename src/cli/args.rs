@@ -430,7 +430,7 @@ pub enum Commands {
     },
 
     /// Delete-safety blast-radius report. Composes four independent
-    /// reference channels — strict refs (binder-resolved v5 edges),
+    /// reference channels — strict refs (native binder edges or Dart Analysis Server),
     /// the legacy FST refs, `grep \b<Name>\b` against the project,
     /// and direct call-graph callers — into a single verdict
     /// (`safe` / `unsafe` / `uncertain`) so an agent doesn't have to
@@ -481,9 +481,10 @@ pub enum Commands {
     /// Find all usages/references of a symbol.
     ///
     /// Default mode reads from the legacy refs FST (identifier mentions on
-    /// 8 T1 languages via AST walk; line-scan fallback elsewhere). Use
+    /// supported AST languages; line-scan fallback elsewhere). Use
     /// `--strict` for binder-resolved refs on Rust / TypeScript / Python /
-    /// C# / C++ / Go / Java / Kotlin — drops false positives from comments / strings / wrong-
+    /// C# / C++ / Go / Java / Kotlin, or live compiler-resolved refs on Dart
+    /// with an available SDK. Drops comments, strings and wrong-
     /// scope same-name refs. Decorator-based dispatch and string-resolved
     /// references (FastAPI `@router.get`, Celery `task.delay`, Uvicorn
     /// factory strings) are invisible to both modes. See
@@ -508,20 +509,18 @@ pub enum Commands {
         #[arg(long)]
         no_stale_check: bool,
 
-        /// Use scope-resolved (binder-backed) refs from the persistent
-        /// v5 `reference_edges` section (shipped in v1.8.0 / Phase
-        /// 11.1). Drops the false positives of the legacy identifier
-        /// FST — comments, doc strings, wrong-scope same-name refs.
-        /// Available for Rust / TypeScript / Python / C# / C++ / Go /
-        /// Java / Kotlin. Errors
-        /// on indexes built before v1.8.0 (re-run `vex index` to
-        /// rebuild). For other languages the legacy FST is the only
-        /// option and is used by default — see `docs/LIMITATIONS.md`.
+        /// Use compiler-resolved Dart refs through a live SDK Analysis Server,
+        /// or persistent binder-resolved `reference_edges` for Rust / TypeScript /
+        /// Python / C# / C++ / Go / Java / Kotlin. Drops comments, strings and
+        /// wrong-scope same-name refs. Dart requires a compatible SDK; set
+        /// `VEX_DART_SDK` to an SDK directory or Dart executable to override
+        /// discovery. Native indexes built before v1.8.0 need `vex index`.
+        /// Other languages use the legacy FST by default — see `docs/LIMITATIONS.md`.
         #[arg(long)]
         strict: bool,
 
         /// Append a JSON usages-trace to stderr after the result list:
-        /// `mode` (`strict` = v5 binder edges; `fst_lookup` = refs FST
+        /// `mode` (`strict` = compiler/binder-resolved refs; `fst_lookup` = refs FST
         /// populated from AST identifier nodes on T1 languages and
         /// line-scan on the rest), `mode_legacy` (back-compat alias
         /// emitting `text_scan` for v1.9.x consumers; removed in
