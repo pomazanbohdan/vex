@@ -58,7 +58,7 @@ pub(super) fn has_dart(ctx: &ChannelContext<'_>) -> bool {
         })
 }
 
-pub(super) fn run(ctx: &ChannelContext<'_>) -> Result<(Vec<HitLocation>, Value)> {
+pub(super) fn run(ctx: &ChannelContext<'_>) -> Result<(Vec<HitLocation>, Option<Value>)> {
     let start = Instant::now();
     let root = normal_path(ctx.root)?;
     let mut targets = Vec::new();
@@ -79,8 +79,12 @@ pub(super) fn run(ctx: &ChannelContext<'_>) -> Result<(Vec<HitLocation>, Value)>
                 .map_err(|kind| anyhow::anyhow!("invalid symbol kind {kind}"))?,
         });
     }
-    let dart = discover_sdk(&root)?;
     let snapshot = Snapshot::capture(ctx, &root)?;
+    if targets.is_empty() {
+        snapshot.verify(ctx, &root, &|| Ok(()))?;
+        return Ok((Vec::new(), None));
+    }
+    let dart = discover_sdk(&root)?;
     let mut files: Vec<_> = targets.iter().map(|t| t.file.clone()).collect();
     files.sort();
     files.dedup();
@@ -221,7 +225,7 @@ pub(super) fn run(ctx: &ChannelContext<'_>) -> Result<(Vec<HitLocation>, Value)>
         hits.into_iter()
             .map(|(path, line)| HitLocation { path, line })
             .collect(),
-        backend,
+        Some(backend),
     ))
 }
 
@@ -453,7 +457,7 @@ impl Snapshot {
 pub(super) fn output(
     mut hits: Vec<HitLocation>,
     ctx: &ChannelContext<'_>,
-    backend: Value,
+    backend: Option<Value>,
 ) -> ChannelOutput {
     let pre_filter_count = hits.len();
     hits.retain(|hit| ctx.path_scope.accept(&hit.path));
@@ -467,7 +471,7 @@ pub(super) fn output(
         pre_filter_count,
         hits,
         dropped,
-        backend: Some(backend),
+        backend,
     }
 }
 
