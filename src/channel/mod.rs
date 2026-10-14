@@ -524,3 +524,576 @@ impl Channel for StrictRefsChannel {
         let mut hits = Vec::new();
         let mut pre_filter_count = 0usize;
         let mut dropped = DropCounts::default();
+        let query_name = ctx.symbol.to_lowercase();
+        for sym_idx in sym_fst.find(ctx.symbol) {
+            let Some(symbol) = ctx.reader.symbol(sym_idx as usize) else {
+                continue;
+            };
+            if ctx.reader.read_string(symbol.name_offset).to_lowercase() != query_name {
+                continue;
+            }
+            for edge in ctx.reader.find_ref_edges_by_symbol(sym_idx) {
+                pre_filter_count += 1;
+                let path = ctx
+                    .file_paths
+                    .get(edge.from_file_id as usize)
+                    .cloned()
+                    .unwrap_or_else(|| "?".to_string());
+                if !ctx.path_scope.accept(&path) {
+                    dropped.scope += 1;
+                    continue;
+                }
+                hits.push(HitLocation {
+                    path,
+                    line: edge.line,
+                });
+            }
+        }
+        let backend = dart_result
+            .as_ref()
+            .and_then(|result| result.backend.clone());
+        if let Some(result) = dart_result {
+            pre_filter_count += result.pre_filter_count;
+            dropped.scope += result.dropped.scope;
+            hits.extend(result.hits);
+            hits.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+            hits.dedup_by(|a, b| a.path == b.path && a.line == b.line);
+        }
+        Ok(ChannelOutput {
+            backend,
+            available: true,
+            unavailable_reason: None,
+            pre_filter_count,
+            hits,
+            dropped,
+        })
+    }
+}
+
+/// Legacy FST identifier scan. Catches every CamelCase / snake_case
+/// occurrence of the name from AST identifier nodes. False-positives
+/// on comments and string literals (Text tier). By default does NOT
+/// apply `is_doc_path` — impact's job is to surface prose mentions
+/// so a symbol referenced only in CHANGELOG yields `Uncertain`
+/// instead of falsely-confident `Safe`. Opt-in `ChannelContext::exclude_docs`
+/// (v1.20.1, D4 parity) strips prose paths for agents that explicitly
+/// want a code-only blast radius. Def-site filter IS always applied
+/// (declarations aren't "uses").
+pub struct FstRefsChannel;
+
+impl Channel for FstRefsChannel {
+    fn name(&self) -> &'static str {
+        "fst_refs"
+    }
+    fn tier(&self) -> ChannelTier {
+        ChannelTier::Text
+    }
+    fn run(&self, ctx: &ChannelContext<'_>) -> Result<ChannelOutput> {
+        let Some(ref_reader) = ctx.reader.ref_reader() else {
+            return Ok(ChannelOutput::unavailable(
+                "index has no refs FST — re-run `vex index`",
+            ));
+        };
+        let raw = ref_reader.find(ctx.symbol);
+        let pre_filter_count = raw.len();
+        let mut hits = Vec::new();
+        let mut dropped = DropCounts::default();
+        for e in raw {
+            // Borrow the path slice for filter checks — H2 fix: skip
+            // the per-row `String` clone we used to pay before
+            // filters. Only surviving rows pay one clone for the
+            // `HitLocation`.
+            let Some(path) = ctx.file_paths.get(e.file_id as usize) else {
+                continue;
+            };
+            let path_str: &str = path.as_str();
+            if !ctx.path_scope.accept(path_str) {
+                dropped.scope += 1;
+                continue;
+            }
+            if ctx.filter_def_sites && is_def_site(ctx.def_sites, path_str, e.line) {
+                dropped.def_site += 1;
+                continue;
+            }
+            if ctx.exclude_docs && crate::util::paths::is_doc_path(path_str) {
+                dropped.docs += 1;
+                continue;
+            }
+            hits.push(HitLocation {
+                path: path.clone(),
+                line: e.line,
+            });
+        }
+        Ok(ChannelOutput {
+            backend: None,
+            available: true,
+            unavailable_reason: None,
+            pre_filter_count,
+            hits,
+            dropped,
+        })
+    }
+}
+
+/// Word-boundary regex scan via `crate::grep`. Catches what the
+/// AST-walking pipelines skip: string-literal dispatch, macros,
+/// configuration files, prose mentions. Text tier. Like
+/// `FstRefsChannel`, by default does NOT apply `is_doc_path` —
+/// filtering prose paths here would defeat the `Uncertain` verdict
+/// for symbols whose only references are external (covered by the
+/// integration test `impact_verdict_uncertain_when_only_text_mentions_in_docs`).
+/// Opt-in `ChannelContext::exclude_docs` strips prose paths
+/// for agents that explicitly want a code-only blast radius.
+pub struct GrepWordBoundaryChannel;
+
+impl Channel for GrepWordBoundaryChannel {
+    fn name(&self) -> &'static str {
+        "grep_word_boundary"
+    }
+    fn tier(&self) -> ChannelTier {
+        ChannelTier::Text
+    }
+    fn run(&self, ctx: &ChannelContext<'_>) -> Result<ChannelOutput> {
+        let escaped = regex::escape(ctx.symbol);
+        let pattern = format!(r"\b{escaped}\b");
+        let raw = crate::grep::search(ctx.root, &pattern, None, GREP_HARD_CAP, ctx.excludes, false)
+            .context("grep word-boundary scan")?;
+        let pre_filter_count = raw.len();
+        let mut hits = Vec::new();
+        let mut dropped = DropCounts::default();
+        for m in raw {
+            // Normalize grep's native-separator relative path to
+            // POSIX so the def-site HashMap (keyed on index-stored
+            // POSIX paths) matches on Windows too.
+            let posix = to_rel_posix(&ctx.root.join(&m.path), ctx.root).unwrap_or(m.path.clone());
+            let Ok(line) = u32::try_from(m.line) else {
+                continue;
+            };
+            if !ctx.path_scope.accept(&posix) {
+                dropped.scope += 1;
+                continue;
+            }
+            if ctx.filter_def_sites && is_def_site(ctx.def_sites, &posix, line) {
+                dropped.def_site += 1;
+                continue;
+            }
+            if ctx.exclude_docs && crate::util::paths::is_doc_path(&posix) {
+                dropped.docs += 1;
+                continue;
+            }
+            hits.push(HitLocation { path: posix, line });
+        }
+        Ok(ChannelOutput {
+            backend: None,
+            available: true,
+            unavailable_reason: None,
+            pre_filter_count,
+            hits,
+            dropped,
+        })
+    }
+}
+
+/// Phase 10.2 v4 call graph — direct callers via
+/// `find_callers_fast`. Binder tier (a call edge is a confirmed
+/// reference). Reports `unavailable` on pre-v4 indexes or when the
+/// call-edges section is empty.
+pub struct CallGraphCallersChannel;
+
+impl Channel for CallGraphCallersChannel {
+    fn name(&self) -> &'static str {
+        "call_graph_callers"
+    }
+    fn tier(&self) -> ChannelTier {
+        ChannelTier::Binder
+    }
+    fn run(&self, ctx: &ChannelContext<'_>) -> Result<ChannelOutput> {
+        if !ctx.reader.has_call_graph() {
+            return Ok(ChannelOutput::unavailable(
+                "index has no v4 call graph section (pre-Phase 10.2 index, or empty call-edges) \
+                 — re-run `vex index`",
+            ));
+        }
+        let callers = crate::store::call_graph::find_callers_fast(
+            ctx.reader,
+            ctx.symbol,
+            crate::callgraph::CALLERS_FETCH_CAP,
+        );
+        // Call-graph edges resolve to function-body sites; def-sites
+        // and doc paths are excluded by construction, so
+        // `filter_def_sites` and `exclude_docs` are no-ops here.
+        // Only `path_scope` applies.
+        let pre_filter_count = callers.len();
+        let mut hits = Vec::new();
+        let mut dropped = DropCounts::default();
+        for m in callers {
+            if !ctx.path_scope.accept(&m.path) {
+                dropped.scope += 1;
+                continue;
+            }
+            let Ok(line) = u32::try_from(m.line) else {
+                continue;
+            };
+            hits.push(HitLocation { path: m.path, line });
+        }
+        Ok(ChannelOutput {
+            backend: None,
+            available: true,
+            unavailable_reason: None,
+            pre_filter_count,
+            hits,
+            dropped,
+        })
+    }
+}
+
+/// Transitive call-graph traversal — `find_reachable` BFS through the
+/// persistent v4 call graph up to `ctx.depth` hops, reporting every
+/// caller at depth ≥ 2 (the direct depth-1 callers stay on
+/// [`CallGraphCallersChannel`]; this channel surfaces the indirect
+/// upstream blast radius). Binder tier — a transitive call edge is
+/// a confirmed structural dependency even though only the
+/// intermediate caller directly references the symbol; deleting the
+/// target still ripples through compilation via the binder-resolved
+/// chain.
+///
+/// `available: false` when `ctx.depth < 2` (the user asked for
+/// direct-only — there is nothing transitive to report) or when the
+/// index lacks the v4 call-graph section. v1.21.0 (`vex impact
+/// --depth N`).
+pub struct TransitiveCallersChannel;
+
+impl Channel for TransitiveCallersChannel {
+    fn name(&self) -> &'static str {
+        "transitive_callers"
+    }
+    fn tier(&self) -> ChannelTier {
+        ChannelTier::Binder
+    }
+    fn run(&self, ctx: &ChannelContext<'_>) -> Result<ChannelOutput> {
+        if ctx.depth < 2 {
+            return Ok(ChannelOutput::unavailable(
+                "transitive walk disabled (--depth=1 — see call_graph_callers for direct callers; \
+                 pass --depth=2 or more to enable)",
+            ));
+        }
+        if !ctx.reader.has_call_graph() {
+            return Ok(ChannelOutput::unavailable(
+                "index has no v4 call graph section (pre-Phase 10.2 index, or empty call-edges) \
+                 — re-run `vex index`",
+            ));
+        }
+        // Borrow the reader for the closure; `find_reachable` calls
+        // `callers_of` once per BFS frontier node, so the closure must
+        // accept `&str` and resolve via the call-graph FST.
+        let reader = ctx.reader;
+        let callers_of = |name: &str| {
+            crate::store::call_graph::find_callers_fast(
+                reader,
+                name,
+                crate::callgraph::CALLERS_FETCH_CAP,
+            )
+        };
+        let matches = crate::callgraph::bfs::find_reachable(
+            callers_of,
+            ctx.symbol,
+            ctx.depth as usize,
+            crate::callgraph::CALLERS_FETCH_CAP,
+        );
+        // Drop depth-1 rows up front so they don't inflate
+        // `pre_filter_count` — direct callers are reported by
+        // `CallGraphCallersChannel`, not here, and counting them as
+        // "pre-filter" here would mislead `--why` trace consumers into
+        // seeing a silent loss with no attributed category. The two
+        // binder channels cover disjoint depth ranges by construction.
+        let transitive: Vec<_> = matches.into_iter().filter(|m| m.depth >= 2).collect();
+        let pre_filter_count = transitive.len();
+        let mut hits = Vec::new();
+        let mut dropped = DropCounts::default();
+        for m in transitive {
+            if !ctx.path_scope.accept(&m.path) {
+                dropped.scope += 1;
+                continue;
+            }
+            let Ok(line) = u32::try_from(m.line) else {
+                continue;
+            };
+            hits.push(HitLocation { path: m.path, line });
+        }
+        Ok(ChannelOutput {
+            backend: None,
+            available: true,
+            unavailable_reason: None,
+            pre_filter_count,
+            hits,
+            dropped,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_result(count: usize, available: bool) -> ChannelResult {
+        if !available {
+            return ChannelResult::unavailable("test");
+        }
+        let hits = (0..count)
+            .map(|i| HitLocation {
+                path: format!("f{i}.rs"),
+                line: (i + 1) as u32,
+            })
+            .collect();
+        ChannelResult::from_hits(hits)
+    }
+
+    /// Helper: build the standard 4-channel invocation list for
+    /// verdict-logic tests. Tier classifications mirror the
+    /// production `DEFAULT_CHANNELS` order in cmd_impact.rs:
+    /// strict_refs (Binder), fst_refs (Text), grep_word_boundary
+    /// (Text), call_graph_callers (Binder).
+    fn standard_invocations(
+        strict: ChannelResult,
+        fst: ChannelResult,
+        grep: ChannelResult,
+        callers: ChannelResult,
+    ) -> Vec<ChannelInvocation> {
+        vec![
+            ChannelInvocation {
+                name: "strict_refs",
+                tier: ChannelTier::Binder,
+                result: strict,
+            },
+            ChannelInvocation {
+                name: "fst_refs",
+                tier: ChannelTier::Text,
+                result: fst,
+            },
+            ChannelInvocation {
+                name: "grep_word_boundary",
+                tier: ChannelTier::Text,
+                result: grep,
+            },
+            ChannelInvocation {
+                name: "call_graph_callers",
+                tier: ChannelTier::Binder,
+                result: callers,
+            },
+        ]
+    }
+
+    #[test]
+    fn verdict_safe_when_all_channels_zero() {
+        let invs = standard_invocations(
+            fake_result(0, true),
+            fake_result(0, true),
+            fake_result(0, true),
+            fake_result(0, true),
+        );
+        let (v, why) = derive_verdict(&invs);
+        assert!(matches!(v, Verdict::Safe), "got: {v:?}");
+        assert!(
+            why.contains("4 of 4 channels reported zero hits"),
+            "explanation must enumerate every channel that ran, got: {why}"
+        );
+        assert!(
+            !why.contains("unavailable"),
+            "no unavailable_note when all channels ran, got: {why}"
+        );
+    }
+
+    #[test]
+    fn verdict_safe_explanation_lists_unavailable_channels() {
+        // strict ran and saw 0, FST + callers unavailable, grep 0.
+        // Safe is justified (strict_refs confirmed) but the
+        // explanation must enumerate which channels were unavailable.
+        let invs = standard_invocations(
+            fake_result(0, true),
+            fake_result(0, false),
+            fake_result(0, true),
+            fake_result(0, false),
+        );
+        let (v, why) = derive_verdict(&invs);
+        assert!(matches!(v, Verdict::Safe), "got: {v:?}");
+        assert!(
+            why.contains("unavailable: fst_refs, call_graph_callers"),
+            "explanation must enumerate unavailable channels in invocation order, got: {why}"
+        );
+        assert!(
+            why.contains("2 of 4 channels"),
+            "explanation must count only channels that ran, got: {why}"
+        );
+    }
+
+    #[test]
+    fn verdict_unsafe_when_strict_confirms() {
+        let invs = standard_invocations(
+            fake_result(3, true),
+            fake_result(5, true),
+            fake_result(7, true),
+            fake_result(0, true),
+        );
+        let (v, why) = derive_verdict(&invs);
+        assert!(matches!(v, Verdict::Unsafe), "got: {v:?}");
+        assert!(
+            why.contains("strict_refs=3"),
+            "explanation must cite strict count, got: {why}"
+        );
+    }
+
+    #[test]
+    fn verdict_unsafe_when_callers_confirm_without_strict() {
+        // Reflection / decorator path: binder doesn't index the ref
+        // but the call-graph extractor sees the call. Must be unsafe.
+        let invs = standard_invocations(
+            fake_result(0, true),
+            fake_result(0, true),
+            fake_result(0, true),
+            fake_result(2, true),
+        );
+        let (v, why) = derive_verdict(&invs);
+        assert!(matches!(v, Verdict::Unsafe), "got: {v:?}");
+        assert!(
+            why.contains("call_graph_callers=2"),
+            "explanation must cite callers count, got: {why}"
+        );
+    }
+
+    #[test]
+    fn verdict_uncertain_when_only_text_channels_hit() {
+        let invs = standard_invocations(
+            fake_result(0, true),
+            fake_result(2, true),
+            fake_result(3, true),
+            fake_result(0, true),
+        );
+        let (v, why) = derive_verdict(&invs);
+        assert!(matches!(v, Verdict::Uncertain), "got: {v:?}");
+        assert!(
+            why.contains("manual inspection"),
+            "explanation must mention manual review, got: {why}"
+        );
+    }
+
+    #[test]
+    fn verdict_uncertain_when_all_binder_channels_unavailable_even_with_grep_zero() {
+        let invs = standard_invocations(
+            fake_result(0, false),
+            fake_result(0, false),
+            fake_result(0, true),
+            fake_result(0, false),
+        );
+        let (v, why) = derive_verdict(&invs);
+        assert!(
+            matches!(v, Verdict::Uncertain),
+            "all binders unavailable + grep=0 must NOT be safe; got: {v:?}"
+        );
+        assert!(
+            why.contains("Re-run `vex index`"),
+            "explanation must point at re-indexing, got: {why}"
+        );
+    }
+
+    #[test]
+    fn verdict_uncertain_explanation_notes_strict_unavailability() {
+        let invs = standard_invocations(
+            fake_result(0, false),
+            fake_result(0, true),
+            fake_result(1, true),
+            fake_result(0, true),
+        );
+        let (v, why) = derive_verdict(&invs);
+        assert!(matches!(v, Verdict::Uncertain), "got: {v:?}");
+        assert!(
+            why.contains("unavailable: strict_refs"),
+            "uncertain explanation must mention which binder channel didn't run, got: {why}"
+        );
+    }
+
+    #[test]
+    fn unavailable_strict_channel_does_not_force_safe_on_grep_hit() {
+        let invs = standard_invocations(
+            fake_result(0, false),
+            fake_result(0, false),
+            fake_result(1, true),
+            fake_result(0, false),
+        );
+        let (v, _) = derive_verdict(&invs);
+        assert!(
+            matches!(v, Verdict::Uncertain),
+            "unavailable strict + grep hit must be uncertain, got: {v:?}"
+        );
+    }
+
+    /// v1.21.0 — future-channel proof. Adding a 5th channel should
+    /// drop into the verdict logic without touching it. This test
+    /// runs `derive_verdict` against a 5-invocation list including
+    /// a hypothetical binder-tier channel and asserts the explanation
+    /// counts/lists the 5 channels correctly.
+    #[test]
+    fn verdict_is_data_driven_over_arbitrary_channel_count() {
+        let invs = vec![
+            ChannelInvocation {
+                name: "strict_refs",
+                tier: ChannelTier::Binder,
+                result: fake_result(0, true),
+            },
+            ChannelInvocation {
+                name: "fst_refs",
+                tier: ChannelTier::Text,
+                result: fake_result(0, true),
+            },
+            ChannelInvocation {
+                name: "grep_word_boundary",
+                tier: ChannelTier::Text,
+                result: fake_result(0, true),
+            },
+            ChannelInvocation {
+                name: "call_graph_callers",
+                tier: ChannelTier::Binder,
+                result: fake_result(0, true),
+            },
+            ChannelInvocation {
+                name: "hypothetical_future_binder",
+                tier: ChannelTier::Binder,
+                result: fake_result(0, true),
+            },
+        ];
+        let (v, why) = derive_verdict(&invs);
+        assert!(matches!(v, Verdict::Safe), "got: {v:?}");
+        assert!(
+            why.contains("5 of 5 channels reported zero hits"),
+            "explanation must scale with channel count, got: {why}"
+        );
+        assert!(
+            why.contains("hypothetical_future_binder"),
+            "new channel name must appear in the available-channels list, got: {why}"
+        );
+    }
+
+    /// Trait identity sanity: tier classification on the 4 concrete
+    /// channels must match the documented contract. Locks the
+    /// Binder/Text split so a future refactor that swaps a tier
+    /// (e.g. moving FST into the Binder pool) fires this test
+    /// loudly rather than silently changing verdict semantics.
+    #[test]
+    fn channel_tier_classification_is_stable() {
+        assert_eq!(StrictRefsChannel.tier(), ChannelTier::Binder);
+        assert_eq!(FstRefsChannel.tier(), ChannelTier::Text);
+        assert_eq!(GrepWordBoundaryChannel.tier(), ChannelTier::Text);
+        assert_eq!(CallGraphCallersChannel.tier(), ChannelTier::Binder);
+        assert_eq!(TransitiveCallersChannel.tier(), ChannelTier::Binder);
+    }
+
+    #[test]
+    fn channel_names_are_stable_wire_keys() {
+        // ImpactChannels::from_invocations matches by these strings;
+        // changing them is a wire-format break.
+        assert_eq!(StrictRefsChannel.name(), "strict_refs");
+        assert_eq!(FstRefsChannel.name(), "fst_refs");
+        assert_eq!(GrepWordBoundaryChannel.name(), "grep_word_boundary");
+        assert_eq!(CallGraphCallersChannel.name(), "call_graph_callers");
+        assert_eq!(TransitiveCallersChannel.name(), "transitive_callers");
+    }
+}
