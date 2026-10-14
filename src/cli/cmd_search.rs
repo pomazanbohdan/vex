@@ -417,8 +417,10 @@ fn produce_results(
             );
         }
         check_embedder_match(root, &embedder_id)?;
-        let mut embedder =
-            crate::embed::make_embedder(&embedder_id).context("load embedding model")?;
+        let mut embedder = crate::embed::query_cache::make_query_embedder(
+            &embedder_id,
+            manifest.vectors_normalized.unwrap_or(false),
+        )?;
         let hnsw_path = config::hnsw_path(root);
         let semantic_results = semantic::search_with_embedder(
             &reader,

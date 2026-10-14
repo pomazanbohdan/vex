@@ -15,6 +15,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`cargo binstall vex-search` / `vex-search-mcp`** download the prebuilt
   release binaries instead of compiling.
 
+
+### Changed
+
+- **Repeated semantic CLI searches reuse exact MiniLM query vectors.** A bounded,
+  SHA-guarded disk cache is checked before ONNX Runtime starts; cache misses,
+  changed model/config artifacts, and invalid cache data keep fresh inference.
+
 ## [1.27.4] - 2026-10-06
 
 ### Fixed
