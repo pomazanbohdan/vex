@@ -21,11 +21,12 @@ use super::queries::{compiled_inheritance_query, relation_label};
 /// **P2 scope decision (locked):** `relation_label` does not currently
 /// distinguish interface `implements` from class `extends` — it lumps
 /// Java/TS/C#/Kotlin `implements` under the `"extends"` label (see
-/// `queries.rs::relation_label`). So `EdgeKind::Implements` (1) is never
-/// produced here in P2; refining the queries to split interface clauses is
+/// `queries.rs::relation_label`). Dart distinguishes `implements` and emits
+/// `EdgeKind::Implements`; refining the older languages' interface clauses is
 /// a documented follow-up (`docs/HIERARCHY-EDGES.md` §4), out of scope now.
 fn relation_to_edge_kind(relation: &str) -> u8 {
     match relation {
+        "implements" => EdgeKind::Implements as u8,
         "uses" | "include" => EdgeKind::Uses as u8,
         // "extends" | "inherits" | "impl" and any other/future label from
         // relation_label fall back to Extends — matches today's exhaustive
@@ -206,6 +207,13 @@ mod tests {
         // A future/unknown label falls back to Extends by design — documented,
         // not a silent bug. When `relation_label` gains a new string, add it
         // above with its intended kind (this is the tripwire).
-        assert_eq!(relation_to_edge_kind("implements"), EdgeKind::Extends as u8);
+        assert_eq!(
+            relation_to_edge_kind("implements"),
+            EdgeKind::Implements as u8
+        );
+        assert_eq!(
+            relation_to_edge_kind("future_relation"),
+            EdgeKind::Extends as u8
+        );
     }
 }
