@@ -20,7 +20,9 @@ use anyhow::Result;
 use rayon::prelude::*;
 
 use crate::index::hasher;
-use crate::index::symbols::{HierarchyCapture, ParsedFile, ParsedSymbol, RawCallEdge, SymbolKind};
+use crate::index::symbols::{
+    HierarchyCapture, ParsedFile, ParsedRef, ParsedSymbol, RawCallEdge, SymbolKind,
+};
 use crate::index::types::{ReconstructedRef, ReconstructedUnresolvedRef};
 use crate::parse;
 use crate::parse::language::Language;
@@ -426,6 +428,84 @@ pub(super) fn reconstruct_unchanged(
         }
     }
 
+    // Carry the ordinary name-to-(file,line) FST refs independently from
+    // resolved ref_edges: unresolved and ref-only files have no symbol row
+    // from which to reconstruct these occurrences.
+    let mut refs_by_path: BTreeMap<String, Vec<ParsedRef>> = BTreeMap::new();
+    if let Some(ref_reader) = reader.ref_reader() {
+        for (name, entries) in ref_reader.find_by_prefix("") {
+            if name.is_empty() {
+                continue;
+            }
+            for entry in entries {
+                let Some(path) = old_file_paths.get(entry.file_id as usize) else {
+                    tracing::warn!(
+                        file_id = entry.file_id,
+                        "refs FST corruption: file_id past file_paths"
+                    );
+                    continue;
+                };
+                if changed.contains(path.as_str()) || deleted.contains(path.as_str()) {
+                    continue;
+                }
+                refs_by_path
+                    .entry(path.clone())
+                    .or_default()
+                    .push(ParsedRef {
+                        name: name.clone(),
+                        line: entry.line as usize,
+                        context: None,
+                    });
+            }
+        }
+    }
+    // Assign refs to symbol-bearing files in their existing index order.
+    // `vectors`, `cluster_carried`, and `cluster_old_sym_idx` were built in
+    // that same order and are consumed positionally by the writer.
+    for file in &mut parsed_files {
+        if let Some(refs) = refs_by_path.remove(&file.path) {
+            file.refs = refs;
+        }
+    }
+
+    // Remaining paths are FST-only files. Their BTreeMap order provides a
+    // deterministic insertion order without moving symbol-bearing files.
+    let mut remaining_refs = refs_by_path.into_iter().peekable();
+    let mut ordered_files = Vec::with_capacity(parsed_files.len() + remaining_refs.len());
+    for file in parsed_files {
+        while remaining_refs
+            .peek()
+            .is_some_and(|(path, _)| path.as_str() < file.path.as_str())
+        {
+            let (path, refs) = remaining_refs.next().expect("peeked ref path");
+            ordered_files.push(ParsedFile {
+                path,
+                symbols: Vec::new(),
+                refs,
+                call_edges: Vec::new(),
+                bound_refs: Vec::new(),
+                skeletons: Vec::new(),
+                cpp_includes: Vec::new(),
+                trigram_bloom: None,
+                hierarchy_captures: Vec::new(),
+            });
+        }
+        ordered_files.push(file);
+    }
+    for (path, refs) in remaining_refs {
+        ordered_files.push(ParsedFile {
+            path,
+            symbols: Vec::new(),
+            refs,
+            call_edges: Vec::new(),
+            bound_refs: Vec::new(),
+            skeletons: Vec::new(),
+            cpp_includes: Vec::new(),
+            trigram_bloom: None,
+            hierarchy_captures: Vec::new(),
+        });
+    }
+    let mut parsed_files = ordered_files;
     // P2a (`docs/HIERARCHY-EDGES.md` §8, architect CRITICAL-1 — mandatory):
     // carry forward hierarchy captures for unchanged files.
     //
@@ -1033,6 +1113,156 @@ pub(super) fn discover_files(root: &Path, excludes: &[String]) -> Result<Vec<std
     }
 
     Ok(files)
+}
+
+#[cfg(test)]
+mod reconstruction_file_order_tests {
+    use super::*;
+    use crate::index::types::ClusterCarryArtefacts;
+    use crate::store::format::{CLUSTER_NEW, CLUSTER_UNCLUSTERED};
+    use crate::store::reader::IndexReader;
+    use crate::store::writer::{
+        write_index_with_call_graph_and_skeletons_and_fingerprints, ClusterInput,
+    };
+    use tempfile::TempDir;
+
+    fn symbol(name: &str) -> ParsedSymbol {
+        ParsedSymbol {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            line: 1,
+            signature: None,
+            doc: None,
+            body_tokens: None,
+        }
+    }
+
+    fn file(path: &str, name: &str, refs: &[(&str, usize)]) -> ParsedFile {
+        ParsedFile {
+            path: path.to_string(),
+            symbols: vec![symbol(name)],
+            refs: refs
+                .iter()
+                .map(|(name, line)| ParsedRef {
+                    name: (*name).to_string(),
+                    line: *line,
+                    context: None,
+                })
+                .collect(),
+            call_edges: Vec::new(),
+            bound_refs: Vec::new(),
+            skeletons: Vec::new(),
+            cpp_includes: Vec::new(),
+            trigram_bloom: None,
+            hierarchy_captures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reconstruction_keeps_symbol_order_and_inserts_fst_only_files_stably() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index.vex");
+        let parsed = vec![
+            file("z.rs", "Zed", &[("ordinary", 9), ("ordinary", 9)]),
+            file("a.rs", "Aye", &[("ordinary", 2)]),
+            ParsedFile {
+                path: "b.js".to_string(),
+                symbols: Vec::new(),
+                refs: vec![ParsedRef {
+                    name: "ordinary".to_string(),
+                    line: 4,
+                    context: None,
+                }],
+                call_edges: Vec::new(),
+                bound_refs: Vec::new(),
+                skeletons: Vec::new(),
+                cpp_includes: Vec::new(),
+                trigram_bloom: None,
+                hierarchy_captures: Vec::new(),
+            },
+        ];
+        let mut z_vector = vec![0.0; 384];
+        z_vector[0] = 1.0;
+        let mut a_vector = vec![0.0; 384];
+        a_vector[1] = 1.0;
+        let carry = ClusterCarryArtefacts {
+            per_symbol_carried: vec![Some(CLUSTER_NEW), Some(CLUSTER_UNCLUSTERED)],
+            per_symbol_old_idx: vec![Some(0), Some(1)],
+            old_symbol_count: 2,
+            resolution: (1, 8),
+            algo_version: 1,
+            levels: 1,
+            build_symbol_count: 2,
+            ..ClusterCarryArtefacts::default()
+        };
+        write_index_with_call_graph_and_skeletons_and_fingerprints(
+            &parsed,
+            &[z_vector.clone(), a_vector.clone()],
+            384,
+            &[],
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            ClusterInput::Carry(carry),
+            &index_path,
+        )
+        .expect("write fixture index");
+
+        let reader = IndexReader::open(&index_path).expect("open fixture index");
+        let changed = HashSet::new();
+        let deleted = HashSet::new();
+        let cluster_reader = reader
+            .cluster_section_reader()
+            .expect("fixture has a cluster section");
+        let reconstructed =
+            reconstruct_unchanged(&reader, &changed, &deleted, None, Some(&cluster_reader));
+
+        assert_eq!(
+            reconstructed
+                .parsed_files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["b.js", "z.rs", "a.rs"]
+        );
+        assert_eq!(
+            reconstructed
+                .parsed_files
+                .iter()
+                .flat_map(|file| file.symbols.iter().map(|symbol| symbol.name.as_str()))
+                .collect::<Vec<_>>(),
+            ["Zed", "Aye"]
+        );
+        assert_eq!(reconstructed.vectors, [z_vector, a_vector]);
+        assert_eq!(
+            reconstructed.cluster_carried,
+            [CLUSTER_NEW, CLUSTER_UNCLUSTERED]
+        );
+        assert_eq!(reconstructed.cluster_old_sym_idx, [0, 1]);
+
+        let mut carried_refs: Vec<_> = reconstructed
+            .parsed_files
+            .iter()
+            .flat_map(|file| {
+                file.refs
+                    .iter()
+                    .map(move |r| (r.name.as_str(), file.path.as_str(), r.line))
+            })
+            .collect();
+        carried_refs.sort_unstable();
+        assert_eq!(
+            carried_refs,
+            [
+                ("ordinary", "a.rs", 2),
+                ("ordinary", "b.js", 4),
+                ("ordinary", "z.rs", 9),
+                ("ordinary", "z.rs", 9),
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
