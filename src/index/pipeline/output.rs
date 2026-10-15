@@ -1605,7 +1605,22 @@ fn commit_hnsw_and_sidecar(
     index
         .save(hnsw_tmp_str)
         .with_context(|| format!("save HNSW to {}", hnsw_tmp.display()))?;
-    if let Err(e) = crate::search::hash_index::save_to_tmp(&hash_tmp, hashes) {
+    let index_path = hnsw_path.with_file_name("index.vex");
+    let sidecar_result = match index_path.try_exists() {
+        Ok(true) => crate::store::reader::IndexReader::open(&index_path)
+            .with_context(|| {
+                format!(
+                    "open sibling index {} for HNSW mapping",
+                    index_path.display()
+                )
+            })
+            .and_then(|reader| {
+                crate::search::hash_index::save_bound_to_tmp(&hash_tmp, hashes, &reader)
+            }),
+        Ok(false) => crate::search::hash_index::save_to_tmp(&hash_tmp, hashes),
+        Err(e) => Err(e).with_context(|| format!("inspect sibling index {}", index_path.display())),
+    };
+    if let Err(e) = sidecar_result {
         // Sidecar tmp failed → HNSW tmp leaked; clean it up before
         // returning so the next run starts from a clean state.
         let _ = std::fs::remove_file(&hnsw_tmp);
@@ -2322,14 +2337,6 @@ mod tests {
         let h_foo: u64 = 0xFEED_C0FF_EEC0_DE42;
         let h_bar: u64 = 0x00BA_0BAB_DEAD_BEEF;
 
-        build_hnsw_at(
-            &hnsw_path,
-            &hash_index_path,
-            &[v_foo.clone(), v_bar.clone()],
-            &[h_foo, h_bar],
-        )
-        .expect("build_hnsw_at");
-
         let index_path = tmp.path().join("index.vex");
         let parsed = vec![ParsedFile {
             path: "fixture.rs".into(),
@@ -2350,17 +2357,24 @@ mod tests {
         )
         .unwrap();
         let reader = crate::store::reader::IndexReader::open(&index_path).unwrap();
+        build_hnsw_at(
+            &hnsw_path,
+            &hash_index_path,
+            &[v_foo.clone(), v_bar.clone()],
+            &[h_foo, h_bar],
+        )
+        .expect("build_hnsw_at");
 
         // Both files must exist after the build — `HnswHandle::open`
         // bails on a missing sidecar even if the HNSW is fine.
         assert!(hnsw_path.exists(), "HNSW file must exist");
         assert!(hash_index_path.exists(), "hash-index sidecar must exist");
 
-        // Open the handle: expected_symbols = 2 (matches both HNSW size
-        // and sidecar length). Should succeed; missing sidecar would
+        // Open the handle against the current reader mapping. Should
+        // succeed; missing or unbound sidecar would
         // return None.
-        let handle =
-            crate::search::semantic::HnswHandle::open(&hnsw_path, dim, 2).expect("open HnswHandle");
+        let handle = crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader)
+            .expect("open HnswHandle");
 
         // Query with v_foo — top-1 must be sym_idx 0 with similarity
         // ~1.0 (the stored vector under hash h_foo).
@@ -2371,6 +2385,78 @@ mod tests {
         let (sym_idx, sim) = results[0];
         assert_eq!(sym_idx, 0, "top-1 must resolve to sym_idx 0 via hash map");
         assert!(sim > 0.99, "self-similarity should be ~1.0, got {sim}");
+    }
+
+    #[test]
+    fn hnsw_bound_mapping_rejects_reordered_equal_vectors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_path = tmp.path().join("index.vex");
+        let hnsw_path = tmp.path().join("index.hnsw");
+        let sidecar_path = tmp.path().join("index.hashes");
+        let dim = MINILM_DIM as usize;
+        let mut vector = vec![0.0_f32; dim];
+        vector[0] = 1.0;
+        let old = vec![ParsedFile {
+            path: "fixture.rs".into(),
+            symbols: vec![mk_sym("first", 1), mk_sym("second", 2)],
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(
+            &old,
+            &[vector.clone(), vector.clone()],
+            dim as u32,
+            &index_path,
+        )
+        .unwrap();
+        build_hnsw_at(
+            &hnsw_path,
+            &sidecar_path,
+            &[vector.clone(), vector.clone()],
+            &compute_hashes_for(&old, MINILM_ID).unwrap(),
+        )
+        .unwrap();
+
+        let reordered = vec![ParsedFile {
+            path: "fixture.rs".into(),
+            symbols: vec![mk_sym("second", 2), mk_sym("first", 1)],
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(
+            &reordered,
+            &[vector.clone(), vector.clone()],
+            dim as u32,
+            &index_path,
+        )
+        .unwrap();
+        let reader = crate::store::reader::IndexReader::open(&index_path).unwrap();
+        assert!(
+            crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader).is_none(),
+            "old mapping must fail even when distinct graph keys have identical vectors"
+        );
+
+        build_hnsw_at(
+            &hnsw_path,
+            &sidecar_path,
+            &[vector.clone(), vector.clone()],
+            &compute_hashes_for(&reordered, MINILM_ID).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader).is_some(),
+            "a correctly reordered v2 mapping opens"
+        );
     }
 
     // ---- v1.15.0 B1.2 incremental HNSW tests ----
@@ -2418,6 +2504,21 @@ mod tests {
 
         let v_new = vec![vec![1.0_f32; dim]];
         let h_new = vec![0xAA_u64];
+        let index_path = tmp.path().join("index.vex");
+        let parsed = vec![ParsedFile {
+            path: "fixture.rs".into(),
+            symbols: (0..v_new.len())
+                .map(|idx| mk_sym(&format!("sym_{idx}"), idx + 1))
+                .collect(),
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(&parsed, &v_new, dim as u32, &index_path).unwrap();
         let applied =
             build_hnsw_incremental_at(&hnsw_path, &hash_index_path, &v_new, &h_new).unwrap();
         assert!(!applied, "missing sidecar → fall back");
@@ -2499,19 +2600,6 @@ mod tests {
         v_new.push(v_added.clone());
         h_new.push(0x2000_u64);
 
-        let applied =
-            build_hnsw_incremental_at(&hnsw_path, &hash_index_path, &v_new, &h_new).unwrap();
-        assert!(
-            applied,
-            "1-remove-1-add at old_size=5 must apply incrementally"
-        );
-
-        // Sidecar must reflect the new sym_idx ordering.
-        let loaded = crate::search::hash_index::load(&hash_index_path).unwrap();
-        assert_eq!(loaded, h_new);
-
-        // Query for the surviving old vector at sym_idx 1: top-1 must
-        // be sym_idx 1 (sidecar position of h_seed[1]).
         let index_path = tmp.path().join("index.vex");
         let parsed = vec![ParsedFile {
             path: "fixture.rs".into(),
@@ -2527,8 +2615,22 @@ mod tests {
             hierarchy_captures: vec![],
         }];
         crate::store::writer::write_index_full(&parsed, &v_new, dim as u32, &index_path).unwrap();
+
+        let applied =
+            build_hnsw_incremental_at(&hnsw_path, &hash_index_path, &v_new, &h_new).unwrap();
+        assert!(
+            applied,
+            "1-remove-1-add at old_size=5 must apply incrementally"
+        );
+
+        // Sidecar must reflect the new sym_idx ordering.
+        let loaded = crate::search::hash_index::load(&hash_index_path).unwrap();
+        assert_eq!(loaded, h_new);
+
+        // Query for the surviving old vector at sym_idx 1: top-1 must
+        // be sym_idx 1 (sidecar position of h_seed[1]).
         let reader = crate::store::reader::IndexReader::open(&index_path).unwrap();
-        let handle = crate::search::semantic::HnswHandle::open(&hnsw_path, dim, h_new.len())
+        let handle = crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader)
             .expect("open handle");
         let results = handle
             .search_with_aliases(&v_seed[1], 1, &reader)

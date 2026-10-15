@@ -8,7 +8,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- **Semantic HNSW results** preserve all symbols sharing a stored vector and fall back when graph keys do not match the hash sidecar.
+- **Semantic HNSW results** preserve aliases and reject stale hash-to-symbol mappings via a versioned sidecar; legacy mappings safely fall back to brute force.
 
 ### Added
 
