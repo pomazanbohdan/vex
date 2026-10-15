@@ -1264,6 +1264,13 @@ retain their existing contracts.
 [The reference-update reproduction guide](docs/REPRODUCING_REFERENCE_UPDATES.md)
 provides the same source fixture for upstream and this branch.
 
+## Query-cache benchmark
+
+[The exact-query benchmark](benchmarks/query-cache/README.md) includes a checked-in
+seven-symbol fixture and a standard-library Python runner. It compares release
+binaries against upstream, verifies output parity and exercises cache misses,
+SHA invalidation and corrupt-cache fallback before reporting warm-query timings.
+
 ## License
 
 MIT
