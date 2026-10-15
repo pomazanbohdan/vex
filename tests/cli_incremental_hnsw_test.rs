@@ -170,6 +170,7 @@ fn bake_v115_index(dir: &Path) -> PathBuf {
     // below.
     let alpha_disk_hash = hasher::content_hash(alpha_content.as_bytes());
     let manifest = Manifest {
+        parse_revision: Some(vex::index::parse_cache::CACHE_FORMAT_VERSION),
         files: [("src/alpha.rs".to_string(), alpha_disk_hash)]
             .into_iter()
             .collect(),

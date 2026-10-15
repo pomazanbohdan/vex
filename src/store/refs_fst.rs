@@ -122,6 +122,20 @@ impl<'a> RefReader<'a> {
         results
     }
 
+    pub(crate) fn for_each(&self, mut visit: impl FnMut(&str, RefEntry)) {
+        use fst::Streamer;
+
+        let mut stream = self.fst_map.stream();
+        while let Some((key, offset)) = stream.next() {
+            let Ok(name) = std::str::from_utf8(key) else {
+                continue;
+            };
+            for entry in self.read_posting_list(offset) {
+                visit(name, entry);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.fst_map.len()
@@ -290,5 +304,34 @@ mod tests {
         let reader = RefReader::new(&fst_bytes, &posting_bytes).unwrap();
 
         assert_eq!(reader.len(), 3); // PaymentGateway, PaymentService, UserRepo
+    }
+
+    #[test]
+    fn iteration_preserves_duplicate_occurrences() {
+        let refs = vec![
+            ParsedRef {
+                name: "Config".into(),
+                line: 7,
+                context: None,
+            },
+            ParsedRef {
+                name: "Config".into(),
+                line: 7,
+                context: None,
+            },
+        ];
+        let files = vec![(3u32, refs.as_slice())];
+        let (fst_bytes, posting_bytes) = build_refs_fst(&files).unwrap();
+        let reader = RefReader::new(&fst_bytes, &posting_bytes).unwrap();
+        let mut occurrences = Vec::new();
+
+        reader.for_each(|name, entry| {
+            occurrences.push((name.to_string(), entry.file_id, entry.line));
+        });
+
+        assert_eq!(
+            occurrences,
+            vec![("Config".to_string(), 3, 7), ("Config".to_string(), 3, 7)]
+        );
     }
 }
