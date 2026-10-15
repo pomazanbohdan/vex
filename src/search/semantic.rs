@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -80,6 +82,60 @@ pub(crate) struct HnswHandle {
     hash_to_sym_indices: HashMap<u64, Vec<u32>>,
 }
 
+fn hnsw_view_preflight(path: &Path, query_dim: usize) -> Result<()> {
+    use usearch::Index;
+
+    let path_str = path.to_str().context("HNSW path is not valid UTF-8")?;
+    Index::metadata(path_str).context("invalid HNSW metadata")?;
+
+    let mut file = File::open(path).context("open HNSW file")?;
+    let file_len = file.metadata()?.len();
+    let mut prefix = [0; 8];
+    file.read_exact(&mut prefix).context("short HNSW prefix")?;
+    let rows = u32::from_le_bytes(prefix[..4].try_into().unwrap()) as u64;
+    let cols = u32::from_le_bytes(prefix[4..].try_into().unwrap()) as u64;
+    let expected_cols = u64::try_from(query_dim)
+        .context("query dimension exceeds HNSW format")?
+        .checked_mul(4)
+        .context("HNSW vector width overflow")?;
+    anyhow::ensure!(cols == expected_cols, "HNSW vector width mismatch");
+
+    let dense_offset = 8_u64
+        .checked_add(
+            rows.checked_mul(cols)
+                .context("HNSW matrix size overflow")?,
+        )
+        .context("HNSW dense header offset overflow")?;
+    let sparse_offset = dense_offset
+        .checked_add(64)
+        .context("HNSW sparse header offset overflow")?;
+    let levels_offset = sparse_offset
+        .checked_add(40)
+        .context("HNSW levels offset overflow")?;
+    anyhow::ensure!(levels_offset <= file_len, "truncated HNSW headers");
+
+    file.seek(SeekFrom::Start(dense_offset))?;
+    let mut dense_header = [0; 64];
+    file.read_exact(&mut dense_header)
+        .context("short HNSW dense header")?;
+    anyhow::ensure!(&dense_header[..7] == b"usearch", "invalid HNSW magic");
+
+    file.seek(SeekFrom::Start(sparse_offset))?;
+    let mut node_count_bytes = [0; 8];
+    file.read_exact(&mut node_count_bytes)
+        .context("short HNSW sparse header")?;
+    let node_count = u64::from_le_bytes(node_count_bytes);
+    let levels_end = levels_offset
+        .checked_add(
+            node_count
+                .checked_mul(2)
+                .context("HNSW levels size overflow")?,
+        )
+        .context("HNSW levels end overflow")?;
+    anyhow::ensure!(levels_end <= file_len, "truncated HNSW levels table");
+    Ok(())
+}
+
 impl HnswHandle {
     /// Open the HNSW file at `hnsw_path` and prepare it for repeated
     /// `search_with_aliases()` calls. Returns `None` for the same reasons
@@ -114,6 +170,10 @@ impl HnswHandle {
             .ok()?;
 
         let path_str = hnsw_path.to_str()?;
+        if let Err(error) = hnsw_view_preflight(hnsw_path, query_dim) {
+            tracing::warn!(path = %hnsw_path.display(), error = %error, "invalid HNSW file bounds — falling back to brute-force");
+            return None;
+        }
         index
             .view(path_str)
             .map_err(|e| {
@@ -328,6 +388,7 @@ pub(crate) fn normalize_in_place(v: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embed::{build_context, cache::context_hash, MINILM_CHAR_BUDGET, MINILM_ID};
 
     #[test]
     fn identical_vectors_have_similarity_1() {
@@ -402,5 +463,58 @@ mod tests {
         crate::store::writer::write_index_full(&[], &[], 0, &index_path).unwrap();
         let reader = IndexReader::open(&index_path).unwrap();
         assert!(HnswHandle::open(path, query.len(), &reader).is_none());
+    }
+
+    #[test]
+    fn hnsw_view_preflight_rejects_malformed_bounds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("index.hnsw");
+        let sidecar = tmp.path().join("index.hashes");
+        let mut vector = vec![0.0; 384];
+        vector[0] = 1.0;
+        let context = build_context(
+            "function",
+            "fixture",
+            "fixture.rs",
+            Some("fn fixture()"),
+            None,
+            Some("fixture"),
+            MINILM_CHAR_BUDGET,
+        );
+        let hash = context_hash(MINILM_ID, &context);
+        crate::index::pipeline::build_hnsw_at(&path, &sidecar, &[vector], &[hash]).unwrap();
+        let valid = std::fs::read(&path).unwrap();
+        assert!(hnsw_view_preflight(&path, 384).is_ok());
+
+        std::fs::write(&path, b"not-a-valid-usearch-graph\0C5").unwrap();
+        assert!(hnsw_view_preflight(&path, 384).is_err());
+        std::fs::write(&path, [0_u8; 4]).unwrap();
+        assert!(hnsw_view_preflight(&path, 384).is_err());
+
+        let mut huge_prefix = Vec::from(u32::MAX.to_le_bytes());
+        huge_prefix.extend_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, huge_prefix).unwrap();
+        assert!(hnsw_view_preflight(&path, 384).is_err());
+
+        let rows = u32::from_le_bytes(valid[..4].try_into().unwrap()) as usize;
+        let cols = u32::from_le_bytes(valid[4..8].try_into().unwrap()) as usize;
+        let dense_offset = 8 + rows * cols;
+        let sparse_offset = dense_offset + 64;
+        let levels_offset = sparse_offset + 40;
+        let node_count =
+            u64::from_le_bytes(valid[sparse_offset..sparse_offset + 8].try_into().unwrap())
+                as usize;
+        for len in [
+            7,
+            dense_offset + 20,
+            sparse_offset + 12,
+            levels_offset + node_count * 2 - 1,
+        ] {
+            std::fs::write(&path, &valid[..len]).unwrap();
+            assert!(
+                hnsw_view_preflight(&path, 384).is_err(),
+                "accepted truncation at {len}"
+            );
+        }
     }
 }
