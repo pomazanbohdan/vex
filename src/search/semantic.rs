@@ -91,12 +91,8 @@ impl HnswHandle {
     /// - the paired `index.hashes` sidecar is missing or malformed
     ///   (pre-1.14.1 indexes have no sidecar — re-run `vex index
     ///   --semantic` to upgrade)
-    /// - the sidecar length disagrees with `expected_symbols`
-    pub(crate) fn open(
-        hnsw_path: &Path,
-        query_dim: usize,
-        expected_symbols: usize,
-    ) -> Option<Self> {
+    /// - the sidecar is legacy/unbound or its symbol-mapping digest is stale
+    pub(crate) fn open(hnsw_path: &Path, query_dim: usize, reader: &IndexReader) -> Option<Self> {
         use usearch::{new_index, IndexOptions, MetricKind, ScalarKind};
 
         if !hnsw_path.exists() {
@@ -134,19 +130,19 @@ impl HnswHandle {
         // malformed the HNSW is unusable (we'd return correct top-k by
         // hash but couldn't map back to records[]) — bail to brute force.
         let hash_index_path = hnsw_path.parent()?.join("index.hashes");
-        let hashes = hash_index::load(&hash_index_path)
+        let hashes = hash_index::load_bound(&hash_index_path, reader)
             .map_err(|e| {
                 tracing::warn!(
                     path = %hash_index_path.display(),
                     error = %e,
-                    "HNSW hash-index sidecar missing or malformed — falling back to brute-force"
+                    "HNSW hash-index mapping is missing, unbound, or stale — re-run `vex index --semantic`; falling back to brute-force"
                 )
             })
             .ok()?;
-        if hashes.len() != expected_symbols {
+        if hashes.len() != reader.symbol_count() {
             tracing::warn!(
                 sidecar = hashes.len(),
-                symbols = expected_symbols,
+                symbols = reader.symbol_count(),
                 "HNSW hash-index sidecar size mismatch — falling back to brute-force"
             );
             return None;
@@ -171,9 +167,9 @@ impl HnswHandle {
         }
 
         tracing::debug!(
-            symbols = expected_symbols,
+            symbols = reader.symbol_count(),
             unique_vectors = index.size(),
-            aliases = expected_symbols - index.size(),
+            aliases = reader.symbol_count() - index.size(),
             "HNSW index opened"
         );
 
@@ -241,7 +237,7 @@ pub(crate) fn search_hnsw_at(
     distinct_hash_limit: usize,
     reader: &IndexReader,
 ) -> Option<Vec<(usize, f32)>> {
-    HnswHandle::open(hnsw_path, query_vec.len(), reader.symbol_count())?.search_with_aliases(
+    HnswHandle::open(hnsw_path, query_vec.len(), reader)?.search_with_aliases(
         query_vec,
         distinct_hash_limit,
         reader,
@@ -400,6 +396,11 @@ mod tests {
     fn hnsw_missing_returns_none() {
         let path = Path::new("/nonexistent/index.hnsw");
         let query = [1.0, 2.0, 3.0];
-        assert!(HnswHandle::open(path, query.len(), 100).is_none());
+        // Missing graph exits before the reader is needed.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_path = tmp.path().join("index.vex");
+        crate::store::writer::write_index_full(&[], &[], 0, &index_path).unwrap();
+        let reader = IndexReader::open(&index_path).unwrap();
+        assert!(HnswHandle::open(path, query.len(), &reader).is_none());
     }
 }

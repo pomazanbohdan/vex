@@ -74,7 +74,7 @@ pub fn find_similar(
     // a single query, so the win is zero — but keeping the same shape
     // as `find_duplicates` makes the code uniform and prevents future
     // multi-query callers from accidentally reopening.
-    let hnsw = semantic::HnswHandle::open(hnsw_path, target_vec.len(), reader.symbol_count());
+    let hnsw = semantic::HnswHandle::open(hnsw_path, target_vec.len(), reader);
     let scored = nearest_neighbors(reader, target_vec, limit + 1, hnsw.as_ref(), normalized);
 
     // Filter: drop self, drop below threshold, drop out-of-bounds indices
@@ -143,7 +143,7 @@ pub fn find_duplicates(
         .and_then(|rec| reader.vector(rec.vector_index))
         .map(|v| v.len())
         .unwrap_or(crate::store::format::VECTOR_DIM as usize);
-    let hnsw = semantic::HnswHandle::open(hnsw_path, query_dim, reader.symbol_count());
+    let hnsw = semantic::HnswHandle::open(hnsw_path, query_dim, reader);
 
     // v1.15.0 A1: parallel outer loop. Each symbol's `nearest_neighbors`
     // call is independent — reader/body_lines/hnsw are all `&` borrows,
