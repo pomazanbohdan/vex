@@ -18,6 +18,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Rust library migration:** complete `vex::index::manifest::Manifest` struct
+  literals must add `parse_revision: None` or use `..Manifest::default()`. Old
+  manifest JSON remains readable and is reparsed once; CLI flags, MCP schema
+  and the binary index version are unchanged.
 - **Incremental updates retain ordinary references from unchanged files.**
   Reference-only files, duplicate same-line occurrences and remapped file IDs
   now survive repeated changes and deletions. Existing affected indexes are

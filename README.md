@@ -1234,6 +1234,21 @@ Search pipeline:
 - **N-way RRF fusion** — `fuse_many` merges structural + BM25 + semantic ranked lists, marks cross-channel hits as `Hybrid`
 - **Ranking eval harness** — `vex eval` over a bundled golden set; CI regression gate on mean nDCG@10 + per-query-type floors + per-channel attribution (Phase 13.12 / 13.12.1)
 
+## Rust library compatibility
+
+The Rust library adds `parse_revision: Option<u16>` to
+`vex::index::manifest::Manifest`. Add `parse_revision: None` to complete struct
+literals, or use a default remainder such as
+`Manifest { files, ..Manifest::default() }`.
+
+Old manifest JSON remains readable. Its missing extraction revision causes one
+reparse on the next update; verified semantic vectors retain their model
+identity. CLI flags, JSON envelopes, MCP schema and the binary index version
+retain their existing contracts.
+
+[The reference-update reproduction guide](docs/REPRODUCING_REFERENCE_UPDATES.md)
+provides the same source fixture for upstream and this branch.
+
 ## License
 
 MIT
