@@ -2343,7 +2343,9 @@ mod tests {
 
         // Query with v_foo — top-1 must be sym_idx 0 with similarity
         // ~1.0 (the stored vector under hash h_foo).
-        let results = handle.search(&v_foo, 1).expect("search succeeds");
+        let results = handle
+            .search_with_aliases(&v_foo, 1)
+            .expect("search succeeds");
         assert_eq!(results.len(), 1);
         let (sym_idx, sim) = results[0];
         assert_eq!(sym_idx, 0, "top-1 must resolve to sym_idx 0 via hash map");
@@ -2491,12 +2493,16 @@ mod tests {
         // be sym_idx 1 (sidecar position of h_seed[1]).
         let handle = crate::search::semantic::HnswHandle::open(&hnsw_path, dim, h_new.len())
             .expect("open handle");
-        let results = handle.search(&v_seed[1], 1).expect("search v_seed[1]");
+        let results = handle
+            .search_with_aliases(&v_seed[1], 1)
+            .expect("search v_seed[1]");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 1, "surviving old vector at new sym_idx 1");
 
         // Query for the freshly-added vector: top-1 must be sym_idx 4.
-        let results = handle.search(&v_added, 1).expect("search v_added");
+        let results = handle
+            .search_with_aliases(&v_added, 1)
+            .expect("search v_added");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 4, "freshly-added vector at new sym_idx 4");
     }
