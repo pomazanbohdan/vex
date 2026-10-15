@@ -83,28 +83,23 @@ fn resolve_by_name_and_path(
 /// ran (architect HIGH-2, LOCKED placement).
 ///
 /// For each file's `hierarchy_captures`:
-/// - `child_name` is resolved to a `SymbolRecord` position **within this
-///   file only** (filtering `name_to_global`'s candidates by
+/// - `child_name` is resolved to a type `SymbolRecord` position **within
+///   this file only** (filtering `type_name_to_global`'s candidates by
 ///   `sym_to_file_id`) — the child is always a local definition, so a
 ///   same-named symbol in a different file must not be picked.
-/// - `parent_name` is resolved via `name_to_global` mirroring the
-///   ref-edge single-candidate rule exactly (Q1 LOCKED):
-///   - exactly one candidate → resolved edge.
-///   - zero candidates (external/stdlib parent) → spill to
-///     `unresolved_hierarchy`, keyed by the verbatim name. Spilled
-///     **unconditionally** — no `is_meaningful_identifier` gate (§3.5).
-///   - more than one candidate (ambiguous) → dropped entirely, not
-///     spilled (ambiguous is a distinct outcome from zero-candidates).
+/// - `parent_name` uses the same type-only map and Q1 LOCKED outcomes:
+///   exactly one type candidate is unambiguous and resolves to that edge;
+///   zero candidates identify an external/stdlib parent and spill to
+///   `unresolved_hierarchy` by verbatim name, unconditionally (no
+///   `is_meaningful_identifier` gate, §3.5); more than one type candidate
+///   is ambiguous, so the edge is dropped rather than mislabeled external.
 ///
-/// An unresolvable `child_name` (no local definition found — shouldn't
-/// normally happen for a parsed def) drops that capture silently; this
-/// mirrors the existing skip-arms in the ref-edge loop above (e.g.
-/// `BindTarget::Local(_) => None`), which also degrade silently rather
-/// than logging per-occurrence noise.
+/// An unresolvable `child_name` (no local type definition found — shouldn't
+/// normally happen for a parsed def) drops that capture silently.
 fn resolve_hierarchy_captures(
     parsed: &[ParsedFile],
     file_ids: &HashMap<String, u32>,
-    name_to_global: &HashMap<&str, Vec<u32>>,
+    type_name_to_global: &HashMap<&str, Vec<u32>>,
     sym_to_file_id: &[u32],
 ) -> (
     Vec<super::hierarchy_edges::HierarchyEdgeBuilder>,
@@ -123,11 +118,11 @@ fn resolve_hierarchy_captures(
 
         for cap in &file.hierarchy_captures {
             // Child must be a local definition in THIS file. Filtering
-            // name_to_global's (project-wide) candidates down to the
+            // type_name_to_global's (project-wide) candidates down to the
             // ones whose sym_to_file_id matches this file_id gives the
             // same-file scoping without needing a separate per-file
             // base_idx map.
-            let child_idx = name_to_global
+            let child_idx = type_name_to_global
                 .get(cap.child_name.as_str())
                 .and_then(|cands| {
                     cands
@@ -139,7 +134,7 @@ fn resolve_hierarchy_captures(
                 continue;
             };
 
-            match name_to_global.get(cap.parent_name.as_str()) {
+            match type_name_to_global.get(cap.parent_name.as_str()) {
                 Some(cands) if cands.len() == 1 => {
                     resolved.push(super::hierarchy_edges::HierarchyEdgeBuilder {
                         to_sym_idx: cands[0],
@@ -585,6 +580,28 @@ fn write_index_to(
         m
     };
 
+    let type_name_to_global: HashMap<&str, Vec<u32>> = {
+        let mut m: HashMap<&str, Vec<u32>> = HashMap::new();
+        let mut global_idx = 0u32;
+        for file in parsed {
+            for sym in &file.symbols {
+                if matches!(
+                    sym.kind,
+                    crate::index::symbols::SymbolKind::Struct
+                        | crate::index::symbols::SymbolKind::Class
+                        | crate::index::symbols::SymbolKind::Interface
+                        | crate::index::symbols::SymbolKind::Trait
+                        | crate::index::symbols::SymbolKind::Enum
+                        | crate::index::symbols::SymbolKind::TypeAlias
+                ) {
+                    m.entry(sym.name.as_str()).or_default().push(global_idx);
+                }
+                global_idx += 1;
+            }
+        }
+        m
+    };
+
     // v1.14 — parallel `Vec<file_id>` indexed by **SymbolRecord position**.
     // The C++ include-BFS resolver below takes any sym_idx stored in
     // `name_to_global` values and translates it back to the defining
@@ -990,7 +1007,7 @@ fn write_index_to(
     // `name_to_global` / `sym_to_file_id` — it cannot corrupt the ref-edge
     // resolution performed above.
     let (hierarchy_edge_builders, unresolved_hierarchy_builders) =
-        resolve_hierarchy_captures(parsed, &file_ids, &name_to_global, &sym_to_file_id);
+        resolve_hierarchy_captures(parsed, &file_ids, &type_name_to_global, &sym_to_file_id);
     let (hierarchy_edge_bytes, hierarchy_index_bytes, hierarchy_postings_bytes) =
         build_hierarchy_section(&hierarchy_edge_builders)?;
     let (
