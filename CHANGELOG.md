@@ -9,6 +9,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - Add Dart indexing with the pinned Orchard grammar and an optional SDK Analysis Server backend for strict references. The Dart client validates source identity, UTF-16 offsets and complete search streams.
+- **Rust library migration:** add a `Language::Dart` arm to exhaustive matches on `vex::parse::language::Language`. Existing language IDs, CLI flags, MCP schema and binary index version are unchanged.
 
 - **`install.sh`**: `curl -fsSL https://raw.githubusercontent.com/tenatarika/vex/main/install.sh | sh`
   installs `vex` and `vex-mcp` from the latest release into `~/.local/bin`

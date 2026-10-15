@@ -38,10 +38,11 @@ Tree-sitter core itself is currently pinned at `0.26`. The grammar version
 column lists the crate's caret range from `Cargo.toml`; the locked patch
 version is in `Cargo.lock`.
 
-Dart has AST-filtered textual refs and name-based call edges. It has no scope
-binder for `vex usages --strict` and does not resolve receiver types or imported
-Dart library identities. See [Dart support](DART_SUPPORT.md) for extraction and
-grammar boundaries.
+Dart's ordinary indexed refs use AST filtering and its call edges match names;
+these paths do not resolve receiver types or imported library identities.
+`vex usages --strict` uses the optional SDK Analysis Server backend for compiler
+resolution instead of a native scope binder. See [Dart support](DART_SUPPORT.md)
+for the SDK contract and grammar boundaries.
 
 ## How extension → language mapping works
 
@@ -104,6 +105,14 @@ lives in `src/parse/queries.rs::try_get_query` and the aggregation in
 9. Add `tests/<lang>_query_test.rs` covering at minimum: grammar loads on
    empty input + one canonical example per symbol kind.
 10. Update this file's version matrix and trim the Roadmap candidates.
+
+### Dart strict-reference backend
+
+Dart uses the optional SDK Analysis Server channel instead of a native scope
+binder. Its ordinary AST refs remain available without an SDK. The proposed
+compiler-backed route, its required evidence and maintainer review are described
+in [CONTRIBUTING](../CONTRIBUTING.md#compiler-backed-strict-references).
+See [Dart support](DART_SUPPORT.md) for freshness and failure behavior.
 
 ## Roadmap
 
