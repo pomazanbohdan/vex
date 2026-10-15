@@ -105,6 +105,14 @@ lives in `src/parse/queries.rs::try_get_query` and the aggregation in
    empty input + one canonical example per symbol kind.
 10. Update this file's version matrix and trim the Roadmap candidates.
 
+### Dart strict-reference backend
+
+Dart uses the optional SDK Analysis Server channel instead of a native scope
+binder. Its ordinary AST refs remain available without an SDK. The proposed
+compiler-backed route, its required evidence and maintainer review are described
+in [CONTRIBUTING](../CONTRIBUTING.md#compiler-backed-strict-references).
+See [Dart support](DART_SUPPORT.md) for freshness and failure behavior.
+
 ## Roadmap
 
 Remaining Phase 4 candidates: Scala, Haskell. File an issue with a use

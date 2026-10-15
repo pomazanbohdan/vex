@@ -115,12 +115,27 @@ Vex supports new languages — see the comprehensive guide in [`docs/SUPPORTED_L
 2. Add a `Language::<Name>` variant in `src/parse/language.rs`.
 3. Write the symbol-extraction query `queries/<lang>.scm` (the only per-language `.scm` file) and register it in `src/parse/queries.rs`; optionally add a call-graph query arm in `src/callgraph/queries.rs`.
 4. Register in `src/hierarchy/queries.rs` (inheritance) and `src/cli/cmd_pattern.rs` (pattern `--lang` spelling).
-5. Add a scope binder in `src/parse/scope/` if your language has imports (enables `vex usages --strict`), and usually add it to `src/parse/language.rs::has_ast_ref_filter` (AST-aware ref filter for non-strict `usages`).
+5. Add a scope binder in `src/parse/scope/` if your language has imports (enables `vex usages --strict`), and usually add it to `src/parse/language.rs::has_ast_ref_filter` (AST-aware ref filter for non-strict `usages`). A proposed compiler-backed alternative requires the evidence and maintainer review described below.
 6. For indexed `vex pattern` prefiltering, add pattern-targetable node kinds in `src/pattern/skeleton/kinds.rs`.
 7. Add per-language test in `tests/<lang>_query_test.rs`.
 8. Update [`docs/SUPPORTED_LANGUAGES.md`](docs/SUPPORTED_LANGUAGES.md).
 
 Before writing the `.scm` files, dump the grammar's `node-types.json` and parse a sample file with an AST printout — this saves multiple `Query::new` compile-fail iterations.
+
+
+### Compiler-backed strict references
+
+A compiler-backed language can provide live strict references through a channel
+instead of persisting a native scope binder. This is an architecture choice for
+maintainer review, not a fallback to name-only matches. The PR must document SDK
+discovery, declaration identity, complete result streams, source freshness,
+timeouts and process cleanup. It must include real-SDK integration tests and an
+explicit unavailable result when the SDK cannot serve a declared target.
+
+Dart proposes this route through the Analysis Server. Its ordinary refs and
+call graph stay index-based; strict references are resolved live. The adapter
+does not register Dart as a native binder language. See
+[Dart support](docs/DART_SUPPORT.md) for the tested contract and limits.
 
 ## Adding an MCP tool
 

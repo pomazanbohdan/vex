@@ -1235,6 +1235,18 @@ Search pipeline:
 - **N-way RRF fusion** — `fuse_many` merges structural + BM25 + semantic ranked lists, marks cross-channel hits as `Hybrid`
 - **Ranking eval harness** — `vex eval` over a bundled golden set; CI regression gate on mean nDCG@10 + per-query-type floors + per-channel attribution (Phase 13.12 / 13.12.1)
 
+## Rust library compatibility
+
+The Rust library adds `vex::parse::language::Language::Dart`. Add a Dart arm to
+exhaustive matches before updating the dependency. Existing language IDs remain
+unchanged. CLI flags, JSON envelopes, MCP schema and the binary index version
+retain their existing contracts.
+
+For a standalone old/new Dart check, see
+[the Dart reproduction guide](docs/REPRODUCING_DART.md). Strict Dart references
+use the optional SDK Analysis Server backend described in
+[Dart support](docs/DART_SUPPORT.md); no native Dart scope binder is claimed.
+
 ## License
 
 MIT
