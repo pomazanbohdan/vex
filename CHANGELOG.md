@@ -15,6 +15,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`cargo binstall vex-search` / `vex-search-mcp`** download the prebuilt
   release binaries instead of compiling.
 
+### Fixed
+
+- `tests-for` preserves same-named call sites by file and line.
+
 ## [1.27.4] - 2026-10-06
 
 ### Fixed

@@ -454,3 +454,49 @@ fn max_hops_zero_returns_empty() {
         "expected empty results with --max-hops 0; got: {rows:?}"
     );
 }
+
+#[test]
+fn same_named_test_sites_remain_distinct() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    init_project(dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn target() {}\n").unwrap();
+    std::fs::write(
+        dir.join("tests/a.rs"),
+        "fn test_same_name() { target(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("tests/b.rs"),
+        "fn test_same_name() { target(); }\n",
+    )
+    .unwrap();
+
+    vex_in(dir)
+        .args(["index", "--no-semantic", "--no-clusters"])
+        .assert()
+        .success();
+    let assert = assert_ran(vex_in(dir).args(["tests-for", "target", "--format", "json"]));
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let rows = results_from(&stdout);
+    let matches: Vec<_> = rows
+        .iter()
+        .filter(|row| row["name"] == "test_same_name")
+        .collect();
+
+    assert_eq!(
+        matches.len(),
+        2,
+        "same-named test sites collapsed: {rows:?}"
+    );
+    for path in ["tests/a.rs", "tests/b.rs"] {
+        assert!(
+            matches
+                .iter()
+                .any(|row| row["path"] == path && row["line"] == 1),
+            "missing {path}:1 site: {matches:?}"
+        );
+    }
+}
