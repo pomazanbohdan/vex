@@ -417,8 +417,9 @@ fn produce_results(
             );
         }
         check_embedder_match(root, &embedder_id)?;
-        let mut embedder =
-            crate::embed::make_embedder(&embedder_id).context("load embedding model")?;
+        let normalized = manifest.vectors_normalized.unwrap_or(false);
+        let mut embedder = crate::embed::query_cache::make_query_embedder(&embedder_id, normalized)
+            .context("load embedding model")?;
         let hnsw_path = config::hnsw_path(root);
         let semantic_results = semantic::search_with_embedder(
             &reader,
@@ -426,7 +427,7 @@ fn produce_results(
             query,
             fetch_limit,
             &hnsw_path,
-            manifest.vectors_normalized.unwrap_or(false),
+            normalized,
         )?;
         if want_prefusion {
             trace_semantic = semantic_results.clone();
