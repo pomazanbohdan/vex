@@ -1249,6 +1249,21 @@ For a standalone old/new Dart check, see
 use the optional SDK Analysis Server backend described in
 [Dart support](docs/DART_SUPPORT.md); no native Dart scope binder is claimed.
 
+### Manifest struct
+
+The Rust library adds `parse_revision: Option<u16>` to
+`vex::index::manifest::Manifest`. Add `parse_revision: None` to complete struct
+literals, or use a default remainder such as
+`Manifest { files, ..Manifest::default() }`.
+
+Old manifest JSON remains readable. Its missing extraction revision causes one
+reparse on the next update; verified semantic vectors retain their model
+identity. CLI flags, JSON envelopes, MCP schema and the binary index version
+retain their existing contracts.
+
+[The reference-update reproduction guide](docs/REPRODUCING_REFERENCE_UPDATES.md)
+provides the same source fixture for upstream and this branch.
+
 ## License
 
 MIT
