@@ -11,14 +11,11 @@
 //!
 //! ## Identity model
 //!
-//! Traversal and the `visited` set both key on **function name only**,
-//! not `(name, path)`. On a polyglot codebase with many `new` / `run` /
-//! `process` definitions, all same-named functions collapse into a
-//! single graph node. This is a deliberate first-cut trade-off — keeps
-//! the BFS layer simple and matches the lowercased-name key used by
-//! the underlying call-graph FST. The `path` field on each step still
-//! carries the file from the matching call edge, so downstream output
-//! disambiguates per call site. A future revision could swap the key
+//! Traversal expansion keys on **function name only**, matching the
+//! underlying call-graph FST. `find_reachable` retains distinct result
+//! sites `(name, path, line)` while expanding each shared name once.
+//! Same-named functions still share adjacency: output sites are not
+//! compiler-resolved identities. A future revision could swap the key
 //! to `(name, file_id)` for stricter identity at the cost of a richer
 //! adjacency model.
 
@@ -156,9 +153,9 @@ fn dfs_paths<F>(
 
 /// Compute the transitive set of symbols whose callees reach `target`.
 ///
-/// Plain BFS backward from `target` through callers, with a `visited`
-/// set to prune cycles. Depth is the BFS level at which the symbol was
-/// discovered; `target` itself is *not* included in the output.
+/// Plain BFS backward from `target` through callers, with one set for
+/// expanded names and another for emitted sites. Depth is the BFS level at
+/// which the site was discovered; `target` itself is excluded from the output.
 pub fn find_reachable<F>(
     callers_of: F,
     target: &str,
@@ -171,8 +168,9 @@ where
     if max_hops == 0 || limit == 0 {
         return Vec::new();
     }
-    let mut visited: HashSet<String> = HashSet::new();
-    visited.insert(target.to_string());
+    let mut expanded_names: HashSet<String> = HashSet::new();
+    expanded_names.insert(target.to_string());
+    let mut emitted_sites = HashSet::new();
     let mut out: Vec<ReachableMatch> = Vec::new();
     let mut frontier: VecDeque<(String, usize)> = VecDeque::new();
     frontier.push_back((target.to_string(), 0));
@@ -181,7 +179,9 @@ where
             continue;
         }
         for caller in callers_of(&node) {
-            if !visited.insert(caller.name.clone()) {
+            if caller.name == target
+                || !emitted_sites.insert((caller.name.clone(), caller.path.clone(), caller.line))
+            {
                 continue;
             }
             out.push(ReachableMatch {
@@ -193,7 +193,9 @@ where
             if out.len() >= limit {
                 return out;
             }
-            frontier.push_back((caller.name, depth + 1));
+            if expanded_names.insert(caller.name.clone()) {
+                frontier.push_back((caller.name, depth + 1));
+            }
         }
     }
     out
@@ -354,6 +356,71 @@ mod tests {
         let callers = mock_graph(&[("D", "C", 1), ("E", "C", 2)]);
         let r = find_reachable(callers, "C", 6, 100);
         assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn reachable_preserves_distinct_sites_but_expands_shared_names_once() {
+        let call = |name: &str, path: &str, line| CallMatch {
+            name: name.into(),
+            path: path.into(),
+            line,
+        };
+        let map = HashMap::from([
+            (
+                "target",
+                vec![
+                    call("worker", "tests/a.rs", 4),
+                    call("worker", "tests/b.rs", 4),
+                    call("worker", "tests/a.rs", 4),
+                ],
+            ),
+            (
+                "worker",
+                vec![
+                    call("wrapper", "tests/a.rs", 3),
+                    call("wrapper", "tests/b.rs", 3),
+                ],
+            ),
+            (
+                "wrapper",
+                vec![
+                    call("target", "src/lib.rs", 1),
+                    call("worker", "tests/a.rs", 4),
+                ],
+            ),
+        ]);
+        let expansions = std::cell::RefCell::new(HashMap::new());
+        let callers = |name: &str| {
+            *expansions.borrow_mut().entry(name.to_string()).or_insert(0) += 1;
+            map.get(name).cloned().unwrap_or_default()
+        };
+        let results = find_reachable(callers, "target", 6, 100);
+        assert_eq!(
+            results.len(),
+            4,
+            "same-name result sites must remain distinct: {results:?}"
+        );
+        for result in &results {
+            assert_ne!(result.name, "target", "target/cycle must not be emitted");
+            assert_eq!(result.depth, if result.name == "worker" { 1 } else { 2 });
+        }
+        assert_eq!(
+            *expansions.borrow(),
+            HashMap::from([
+                ("target".to_string(), 1),
+                ("worker".to_string(), 1),
+                ("wrapper".to_string(), 1)
+            ])
+        );
+        let one_hop = find_reachable(callers, "target", 1, 100);
+        assert_eq!(one_hop.len(), 2);
+        assert!(one_hop.iter().all(|m| m.name == "worker" && m.depth == 1));
+        let capped = find_reachable(callers, "target", 6, 1);
+        assert_eq!(capped.len(), 1);
+        assert_eq!(
+            capped[0].path, "tests/a.rs",
+            "input/BFS order must be preserved at the limit"
+        );
     }
 
     #[test]

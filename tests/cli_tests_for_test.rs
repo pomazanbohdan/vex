@@ -454,3 +454,55 @@ fn max_hops_zero_returns_empty() {
         "expected empty results with --max-hops 0; got: {rows:?}"
     );
 }
+
+#[test]
+fn fixture_expansion_preserves_same_named_sites_across_rust_files() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    init_project(dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn target() {}\n").unwrap();
+    std::fs::write(
+        dir.join("tests/a.rs"),
+        "fn shared_fixture() {}\nfn test_alpha() { target(); shared_fixture(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("tests/b.rs"),
+        "fn shared_fixture() {}\nfn test_beta() { target(); shared_fixture(); }\n",
+    )
+    .unwrap();
+
+    vex_in(dir)
+        .args(["index", "--no-semantic", "--no-clusters"])
+        .assert()
+        .success();
+    let assert = assert_ran(vex_in(dir).args([
+        "tests-for",
+        "target",
+        "--max-hops",
+        "1",
+        "--include-fixtures",
+        "--format",
+        "json",
+    ]));
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let rows = results_from(&stdout);
+    let fixtures: Vec<_> = rows
+        .iter()
+        .filter(|row| row["name"] == "shared_fixture")
+        .collect();
+    assert_eq!(
+        fixtures.len(),
+        2,
+        "same-named fixture sites collapsed: {rows:?}"
+    );
+    for path in ["tests/a.rs", "tests/b.rs"] {
+        assert!(
+            fixtures.iter().any(|row| row["path"] == path),
+            "missing shared_fixture site in {path}: {fixtures:?}"
+        );
+    }
+    assert!(!rows.iter().any(|row| row["name"] == "target"));
+}
