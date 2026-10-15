@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::index::manifest::{self, Manifest};
+use crate::index::parse_revision;
 use crate::util::config;
 
 mod lock;
@@ -245,6 +246,9 @@ fn try_skip_update(
     }
     let reader = crate::store::reader::IndexReader::open(&index_path)
         .context("open existing index to check update skip eligibility")?;
+    if !parse_revision::is_current(&config::index_dir(root)) {
+        return Ok(None);
+    }
     if reader.header().version < crate::store::format::VERSION {
         return Ok(None);
     }
@@ -344,6 +348,7 @@ fn run_with_lock(
             let diff = manifest::diff_files(&hashed.hashes, &current_manifest);
             if diff.changed.is_empty()
                 && diff.deleted.is_empty()
+                && parse_revision::is_current(&config::index_dir(root))
                 && run_can_skip(&current_manifest, opts, embedder_id)
             {
                 tracing::info!(
@@ -390,6 +395,7 @@ fn run_with_lock(
         None
     };
     let vector_dim = vector_dim_for(embedder_id, &vectors);
+    parse_revision::invalidate(&config::index_dir(root))?;
     write_output_locked(
         root,
         &all_parsed,
@@ -442,6 +448,8 @@ fn run_with_lock(
             "semantic channel dropped (--drop-semantic): HNSW + sidecar + embed cache removed"
         );
     }
+
+    parse_revision::save(&config::index_dir(root))?;
 
     tracing::info!(
         symbols = symbol_count,
@@ -610,11 +618,16 @@ fn update_inner(
     // index while we waited. Re-diff against the now-current manifest AND
     // re-check option coverage — a peer that built without our options'd
     // otherwise serve us a downgraded index.
-    let (diff, current_manifest) = {
+    let (mut diff, current_manifest) = {
         let current_manifest = Manifest::load(&manifest_path)?;
         let diff = manifest::diff_files(&hashed.hashes, &current_manifest);
         (diff, current_manifest)
     };
+    if config::index_path(&root).exists() && !parse_revision::is_current(&config::index_dir(&root))
+    {
+        diff.changed = hashed.hashes.iter().map(|(path, _)| path.clone()).collect();
+        diff.unchanged = 0;
+    }
     if diff.changed.is_empty() && diff.deleted.is_empty() {
         if let Some(symbol_count) = try_skip_update(&current_manifest, opts, embedder_id, &root)? {
             tracing::info!("index refreshed by a concurrent vex instance; skipping rebuild");
@@ -1033,6 +1046,7 @@ fn update_inner(
         None
     };
     let vector_dim = vector_dim_for(embedder_id, &all_vectors);
+    parse_revision::invalidate(&config::index_dir(&root))?;
     write_output_locked(
         &root,
         &all_parsed,
@@ -1086,6 +1100,8 @@ fn update_inner(
                 .context("remove stale HNSW hash-index sidecar")?;
         }
     }
+
+    parse_revision::save(&config::index_dir(&root))?;
 
     tracing::info!(
         total = symbol_count,
