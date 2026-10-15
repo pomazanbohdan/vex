@@ -214,6 +214,7 @@ mod parse_count_tests {
         (Language::Lua, "lua", 1),
         (Language::Yaml, "yaml", 1),
         (Language::Toml, "toml", 1),
+        (Language::Dart, "dart", 1),
     ];
 
     fn parse_count_for(rel: &str, lang: Language) -> u64 {
