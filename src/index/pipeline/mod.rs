@@ -42,6 +42,153 @@ use parse_files::{
 
 const CHUNK_SIZE: usize = 500;
 
+struct MigrationVector {
+    symbol: crate::index::symbols::ParsedSymbol,
+    context: String,
+    hash: u64,
+    vector: Vec<f32>,
+}
+
+struct MigratedFiles {
+    files: Vec<crate::index::symbols::ParsedFile>,
+    vectors: Vec<Vec<f32>>,
+}
+
+fn collect_migration_vectors(
+    reader: &crate::store::reader::IndexReader,
+    manifest: &Manifest,
+    changed: &HashSet<&str>,
+    body_tokens: Option<&[Option<String>]>,
+    hash_path: &Path,
+) -> Option<(String, HashMap<String, Vec<MigrationVector>>)> {
+    let id = manifest.embedder_id.as_deref()?;
+    let dim = crate::embed::embedder_dim(id)? as usize;
+    if dim != reader.header().vector_dim as usize || manifest.vectors_normalized != Some(true) {
+        return None;
+    }
+    let budget = crate::embed::embedder_char_budget(id)?;
+    let bodies = body_tokens?;
+    let hashes = crate::search::hash_index::load(hash_path).ok()?;
+    if bodies.len() != reader.symbol_count() || hashes.len() != reader.symbol_count() {
+        return None;
+    }
+
+    let mut files: HashMap<String, Vec<MigrationVector>> = HashMap::new();
+    for (i, &hash) in hashes.iter().enumerate() {
+        let record = reader.symbol(i)?;
+        let path = reader.read_string(record.file_offset);
+        if changed.contains(path) {
+            continue;
+        }
+        let signature = reader.read_string(record.signature_offset);
+        let symbol = crate::index::symbols::ParsedSymbol {
+            name: reader.read_string(record.name_offset).to_string(),
+            kind: crate::index::symbols::SymbolKind::try_from(record.kind).ok()?,
+            line: record.line as usize,
+            signature: (!signature.is_empty()).then(|| signature.to_string()),
+            // SymbolRecord does not persist docs; hash validation below
+            // rejects prior vectors whose context depended on a doc.
+            doc: None,
+            body_tokens: bodies[i].clone(),
+        };
+        let context = crate::embed::build_context(
+            symbol.kind.as_str(),
+            &symbol.name,
+            path,
+            symbol.signature.as_deref(),
+            None,
+            symbol.body_tokens.as_deref(),
+            budget,
+        );
+        if crate::embed::cache::context_hash(id, &context) != hash {
+            return None;
+        }
+        let vector = reader.vector(record.vector_index)?.to_vec();
+        if vector.len() != dim || vector.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        files
+            .entry(path.to_string())
+            .or_default()
+            .push(MigrationVector {
+                symbol,
+                context,
+                hash,
+                vector,
+            });
+    }
+    Some((id.to_string(), files))
+}
+
+fn reuse_migration_vectors(
+    fresh_files: Vec<crate::index::symbols::ParsedFile>,
+    embedder_id: &str,
+    mut old_files: HashMap<String, Vec<MigrationVector>>,
+) -> Result<MigratedFiles> {
+    let budget = crate::embed::embedder_char_budget(embedder_id)
+        .context("migration embedder has no known context budget")?;
+    let mut retained_files = Vec::new();
+    let mut retained_vectors = Vec::new();
+    let mut unembedded_files = Vec::new();
+
+    for fresh in fresh_files {
+        let Some(old) = old_files.remove(&fresh.path) else {
+            unembedded_files.push(fresh);
+            continue;
+        };
+        let mut old_by_key = HashMap::new();
+        let mut ambiguous = HashSet::new();
+        for (idx, prior) in old.iter().enumerate() {
+            let key = (prior.symbol.name.as_str(), prior.symbol.kind);
+            if old_by_key.insert(key, idx).is_some() {
+                ambiguous.insert(key);
+            }
+        }
+        let mut matched = Vec::with_capacity(fresh.symbols.len());
+        let mut used = HashSet::new();
+        let mut valid = old.len() == fresh.symbols.len();
+        for symbol in &fresh.symbols {
+            let key = (symbol.name.as_str(), symbol.kind);
+            let Some(&idx) = old_by_key.get(&key) else {
+                valid = false;
+                break;
+            };
+            if ambiguous.contains(&key) || !used.insert(idx) {
+                valid = false;
+                break;
+            }
+            let prior = &old[idx];
+            let context = crate::embed::build_context(
+                symbol.kind.as_str(),
+                &symbol.name,
+                &fresh.path,
+                symbol.signature.as_deref(),
+                symbol.doc.as_deref(),
+                symbol.body_tokens.as_deref(),
+                budget,
+            );
+            if context != prior.context
+                || crate::embed::cache::context_hash(embedder_id, &context) != prior.hash
+            {
+                valid = false;
+                break;
+            }
+            matched.push(idx);
+        }
+        if valid && matched.len() == old.len() {
+            retained_vectors.extend(matched.iter().map(|&idx| old[idx].vector.clone()));
+            retained_files.push(fresh);
+        } else {
+            unembedded_files.push(fresh);
+        }
+    }
+    retained_files.extend(unembedded_files);
+    Ok(MigratedFiles {
+        files: retained_files,
+        vectors: retained_vectors,
+    })
+}
+
 /// Build-time toggles for [`run`] and [`update`].
 ///
 /// `with_embeddings` is a transient run-time choice (the user decides per
@@ -623,6 +770,10 @@ fn update_inner(
         let diff = manifest::diff_files(&hashed.hashes, &current_manifest);
         (diff, current_manifest)
     };
+    // Keep the source-level diff distinct from parser-revision invalidation:
+    // migration can only reuse vectors for files whose bytes are unchanged.
+    let content_changed_paths: HashSet<String> =
+        diff.changed.iter().chain(&diff.deleted).cloned().collect();
     if config::index_path(&root).exists() && !parse_revision::is_current(&config::index_dir(&root))
     {
         diff.changed = hashed.hashes.iter().map(|(path, _)| path.clone()).collect();
@@ -824,9 +975,20 @@ fn update_inner(
             None
         }
     };
+    let mut migration_vectors = None;
     let (unchanged_parsed, unchanged_vectors, mut artefacts) = if index_path.exists() {
         let reader = crate::store::reader::IndexReader::open(&index_path)
             .context("open existing index for incremental merge")?;
+        if !parse_revision::is_current(&config::index_dir(&root)) && !opts.with_embeddings {
+            let changed: HashSet<&str> = content_changed_paths.iter().map(String::as_str).collect();
+            migration_vectors = collect_migration_vectors(
+                &reader,
+                &current_manifest,
+                &changed,
+                body_tokens_sidecar.as_deref(),
+                &config::hash_index_path(&root),
+            );
+        }
         // P4b (`docs/V9-FORMAT.md` §13 R11) — built from THIS `reader`,
         // the same one handed to `reconstruct_unchanged` two lines below
         // and to the old-symbols-by-path / old-table extraction further
@@ -1018,9 +1180,30 @@ fn update_inner(
     all_parsed.extend(newly_parsed);
     let symbol_count: usize = all_parsed.iter().map(|f| f.symbols.len()).sum();
 
-    let unchanged_count = unchanged_vectors.len();
+    let mut unchanged_count = unchanged_vectors.len();
     let mut all_vectors = unchanged_vectors;
     all_vectors.extend(new_vectors);
+    let mut retained_embedder = None;
+    if let Some((id, old_files)) = migration_vectors {
+        let migrated = reuse_migration_vectors(all_parsed, &id, old_files)?;
+        all_parsed = migrated.files;
+        all_vectors = migrated.vectors;
+        unchanged_count = all_vectors.len();
+        if !all_vectors.is_empty() {
+            retained_embedder = Some(id);
+            // Reordering parsed files to put reusable vectors in the writer's
+            // prefix can invalidate per-symbol cluster carry ordinals.
+            artefacts.cluster_carry = None;
+        }
+    }
+    let semantic_embedder_id = if opts.with_embeddings {
+        embedder_id
+    } else {
+        retained_embedder
+            .as_deref()
+            .or(current_manifest.embedder_id.as_deref())
+            .unwrap_or(embedder_id)
+    };
     // v1.13 P5: normalize the merged set so the result is always
     // L2-normalized regardless of legacy state. Key subtlety: when the
     // existing index is ALREADY normalized (v1.13+), re-normalizing
@@ -1040,12 +1223,14 @@ fn update_inner(
         }
     }
 
-    let manifest_embedder = if opts.with_embeddings && !all_vectors.is_empty() {
-        Some(embedder_id.to_string())
-    } else {
+    let manifest_embedder = if all_vectors.is_empty() {
         None
+    } else if opts.with_embeddings || retained_embedder.is_some() {
+        Some(semantic_embedder_id.to_string())
+    } else {
+        current_manifest.embedder_id.clone()
     };
-    let vector_dim = vector_dim_for(embedder_id, &all_vectors);
+    let vector_dim = vector_dim_for(semantic_embedder_id, &all_vectors);
     parse_revision::invalidate(&config::index_dir(&root))?;
     write_output_locked(
         &root,
@@ -1060,7 +1245,7 @@ fn update_inner(
     )?;
 
     if !all_vectors.is_empty() {
-        let all_hashes = compute_hashes_for(&all_parsed, embedder_id)?;
+        let all_hashes = compute_hashes_for(&all_parsed, semantic_embedder_id)?;
         // v1.15.0 B1.2: try the incremental HNSW path first.
         //   Ok(true)  — incremental applied; HNSW + hash-index sidecar
         //               on disk in post-update state. SKIP full rebuild.
@@ -1084,8 +1269,8 @@ fn update_inner(
         // `unchanged + newly_parsed`, NOT just `_new_hashes` from
         // generate_embeddings (that would evict every unchanged
         // symbol's cache entry and defeat the cache on the next run).
-        let dim = vector_dim_for(embedder_id, &all_vectors);
-        let _ = prune_embed_cache(&root, embedder_id, dim, &all_hashes);
+        let dim = vector_dim_for(semantic_embedder_id, &all_vectors);
+        let _ = prune_embed_cache(&root, semantic_embedder_id, dim, &all_hashes);
     } else {
         // Same paired cleanup as the full-rebuild path — drop both
         // sidecars together so the next `vex search --semantic` gets

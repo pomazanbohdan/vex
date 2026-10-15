@@ -1548,7 +1548,28 @@ pub(super) fn compute_hashes_for(parsed: &[ParsedFile], embedder_id: &str) -> Re
 pub(super) fn build_hnsw(root: &Path, vectors: &[Vec<f32>], hashes: &[u64]) -> Result<()> {
     let hnsw_path = config::hnsw_path(root);
     let hash_index_path = config::hash_index_path(root);
+    // A shorter vector prefix is a valid partial-semantic state; the
+    // public `_at` helper keeps rejecting every cardinality mismatch.
+    if vectors.len() < hashes.len() {
+        remove_hnsw_pair(&hnsw_path, &hash_index_path)?;
+        tracing::debug!(
+            vectors = vectors.len(),
+            hashes = hashes.len(),
+            "HNSW build skipped for partial semantic vectors"
+        );
+        return Ok(());
+    }
     build_hnsw_at(&hnsw_path, &hash_index_path, vectors, hashes)
+}
+
+fn remove_hnsw_pair(hnsw_path: &Path, hash_index_path: &Path) -> Result<()> {
+    if hnsw_path.exists() {
+        std::fs::remove_file(hnsw_path).context("remove stale HNSW index")?;
+    }
+    if hash_index_path.exists() {
+        std::fs::remove_file(hash_index_path).context("remove stale HNSW hash-index sidecar")?;
+    }
+    Ok(())
 }
 
 // v1.15.0 B1.2 — `build_hnsw_at` and `build_hnsw_incremental_at` are
@@ -1863,6 +1884,14 @@ pub(super) fn build_hnsw_incremental(
 ) -> Result<bool> {
     let hnsw_path = config::hnsw_path(root);
     let hash_index_path = config::hash_index_path(root);
+    if new_vectors.len() < new_hashes.len() {
+        tracing::debug!(
+            vectors = new_vectors.len(),
+            hashes = new_hashes.len(),
+            "incremental HNSW skipped for partial semantic vectors"
+        );
+        return Ok(false);
+    }
     build_hnsw_incremental_at(&hnsw_path, &hash_index_path, new_vectors, new_hashes)
 }
 
