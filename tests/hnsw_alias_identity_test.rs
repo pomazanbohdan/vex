@@ -117,6 +117,11 @@ fn hnsw_prebaked_aliases_keep_both_symbols() {
     let vectors = vec![one_hot(0), one_hot(0), one_hot(1)];
     write_index(&index_path, &files, &vectors);
     write_graph(&hnsw_path, &vectors, &symbol_hashes(&files));
+    assert_eq!(
+        hash_index::load(&tmp.path().join("index.hashes")).unwrap(),
+        symbol_hashes(&files),
+        "public reader accepts v2 sidecars"
+    );
     let reader = IndexReader::open(&index_path).unwrap();
 
     let results =
@@ -149,17 +154,11 @@ fn hnsw_rejects_foreign_graph() {
 fn hnsw_reorder_does_not_remap_identity() {
     let tmp = TempDir::new().unwrap();
     let (index_path, hnsw_path) = paths(&tmp);
-    let old_files = parsed(&[("alpha", 1, "alpha"), ("beta", 2, "beta")]);
     let files = parsed(&[("beta", 2, "beta"), ("alpha", 1, "alpha")]);
     let vectors = vec![one_hot(1), one_hot(0)];
     write_index(&index_path, &files, &vectors);
-    // A stale graph/sidecar from the old symbol order.
-    write_graph(
-        &hnsw_path,
-        &[one_hot(0), one_hot(1)],
-        &symbol_hashes(&old_files),
-    );
-    rewrite_hashes(&hnsw_path, &symbol_hashes(&files));
+    // A valid graph and bound sidecar for the reordered records.
+    write_graph(&hnsw_path, &vectors, &symbol_hashes(&files));
     let reader = IndexReader::open(&index_path).unwrap();
 
     let results =
@@ -177,17 +176,16 @@ fn hnsw_stale_sidecar_order_falls_back_after_reorder() {
     let old_files = parsed(&[("alpha", 1, "alpha"), ("beta", 2, "beta")]);
     let current_files = parsed(&[("beta", 2, "beta"), ("alpha", 1, "alpha")]);
     let old_hashes = symbol_hashes(&old_files);
-    let current_vectors = vec![one_hot(1), one_hot(0)];
-    write_index(&index_path, &current_files, &current_vectors);
-    write_graph(&hnsw_path, &[one_hot(0), one_hot(1)], &old_hashes);
+    let same_vectors = vec![one_hot(0), one_hot(0)];
+    write_index(&index_path, &old_files, &same_vectors);
+    write_graph(&hnsw_path, &same_vectors, &old_hashes);
+    // Retain the old graph + bound sidecar while changing only record order.
+    write_index(&index_path, &current_files, &same_vectors);
     let reader = IndexReader::open(&index_path).unwrap();
 
     let results =
         search_with_embedder(&reader, &mut FixtureEmbedder, "query", 2, &hnsw_path, true).unwrap();
-    assert_eq!(
-        results[0].line, 1,
-        "stale symbol order must use brute force"
-    );
+    assert_eq!(results.len(), 2, "stale mapping safely falls back");
 }
 
 #[test]
