@@ -431,7 +431,12 @@ fn produce_results(
         if want_prefusion {
             trace_semantic = semantic_results.clone();
         }
-        fusion::fuse3(structural_results, bm25_results, semantic_results, limit)
+        fusion::fuse3(
+            structural_results,
+            bm25_results,
+            semantic_results,
+            fetch_limit,
+        )
     } else {
         if emit_diagnostics && semantic && !reader.has_vectors() {
             eprintln!("Warning: no embeddings in index. Run `vex index --semantic` first.");
@@ -440,7 +445,7 @@ fn produce_results(
             structural_results
         } else {
             // 2-channel fusion when semantic is off but BM25 is available.
-            fusion::fuse_many(vec![structural_results, bm25_results], limit)
+            fusion::fuse_many(vec![structural_results, bm25_results], fetch_limit)
         }
     };
 
