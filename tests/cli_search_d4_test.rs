@@ -128,6 +128,44 @@ fn search_code_only_triggers_overfetch_so_limit_is_honoured() {
     }
 }
 
+#[test]
+fn search_fuses_overfetched_rows_before_path_filter_limit() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join(".vex.toml"), "local_cache = true\n").unwrap();
+    for dir in ["a_excluded", "z_included"] {
+        std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        for idx in 0..3 {
+            std::fs::write(
+                tmp.path().join(dir).join(format!("item{idx}.rs")),
+                "pub fn Invoice() {}\n",
+            )
+            .unwrap();
+        }
+    }
+    vex_in(tmp.path()).arg("index").assert().success();
+
+    let output = assert_ran(vex_in(tmp.path()).args([
+        "search",
+        "Invoice",
+        "--include",
+        "z_included/**",
+        "--limit",
+        "2",
+        "--format",
+        "json",
+    ]));
+    let json: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    let results = json["results"].as_array().unwrap();
+    assert_eq!(
+        results.len(),
+        2,
+        "fusion truncated before path filtering: {json}"
+    );
+    assert!(results.iter().all(|row| row["path"]
+        .as_str()
+        .is_some_and(|path| path.starts_with("z_included/"))));
+}
+
 /// Tiny inline mirror of `src/util/paths.rs::is_doc_path` so the
 /// test binary doesn't pull in the whole vex lib just to check
 /// extensions. Kept lockstep with the canonical list.
