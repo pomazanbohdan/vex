@@ -2193,7 +2193,7 @@ pub fn __fuzz_incremental_hnsw_bytes(data: &[u8]) {
 mod tests {
     use super::*;
     use crate::embed::{cache::context_hash, MINILM_CHAR_BUDGET, MINILM_DIM, MINILM_ID};
-    use crate::index::symbols::{ParsedSymbol, SymbolKind};
+    use crate::index::symbols::{ParsedFile, ParsedSymbol, SymbolKind};
 
     fn mk_sym(name: &str, line: usize) -> ParsedSymbol {
         ParsedSymbol {
@@ -2330,6 +2330,27 @@ mod tests {
         )
         .expect("build_hnsw_at");
 
+        let index_path = tmp.path().join("index.vex");
+        let parsed = vec![ParsedFile {
+            path: "fixture.rs".into(),
+            symbols: vec![mk_sym("foo", 1), mk_sym("bar", 2)],
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(
+            &parsed,
+            &[v_foo.clone(), v_bar.clone()],
+            dim as u32,
+            &index_path,
+        )
+        .unwrap();
+        let reader = crate::store::reader::IndexReader::open(&index_path).unwrap();
+
         // Both files must exist after the build — `HnswHandle::open`
         // bails on a missing sidecar even if the HNSW is fine.
         assert!(hnsw_path.exists(), "HNSW file must exist");
@@ -2343,7 +2364,9 @@ mod tests {
 
         // Query with v_foo — top-1 must be sym_idx 0 with similarity
         // ~1.0 (the stored vector under hash h_foo).
-        let results = handle.search(&v_foo, 1).expect("search succeeds");
+        let results = handle
+            .search_with_aliases(&v_foo, 1, &reader)
+            .expect("search succeeds");
         assert_eq!(results.len(), 1);
         let (sym_idx, sim) = results[0];
         assert_eq!(sym_idx, 0, "top-1 must resolve to sym_idx 0 via hash map");
@@ -2489,14 +2512,34 @@ mod tests {
 
         // Query for the surviving old vector at sym_idx 1: top-1 must
         // be sym_idx 1 (sidecar position of h_seed[1]).
+        let index_path = tmp.path().join("index.vex");
+        let parsed = vec![ParsedFile {
+            path: "fixture.rs".into(),
+            symbols: (0..v_new.len())
+                .map(|idx| mk_sym(&format!("sym_{idx}"), idx + 1))
+                .collect(),
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(&parsed, &v_new, dim as u32, &index_path).unwrap();
+        let reader = crate::store::reader::IndexReader::open(&index_path).unwrap();
         let handle = crate::search::semantic::HnswHandle::open(&hnsw_path, dim, h_new.len())
             .expect("open handle");
-        let results = handle.search(&v_seed[1], 1).expect("search v_seed[1]");
+        let results = handle
+            .search_with_aliases(&v_seed[1], 1, &reader)
+            .expect("search v_seed[1]");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 1, "surviving old vector at new sym_idx 1");
 
         // Query for the freshly-added vector: top-1 must be sym_idx 4.
-        let results = handle.search(&v_added, 1).expect("search v_added");
+        let results = handle
+            .search_with_aliases(&v_added, 1, &reader)
+            .expect("search v_added");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 4, "freshly-added vector at new sym_idx 4");
     }

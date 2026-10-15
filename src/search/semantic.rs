@@ -27,7 +27,7 @@ pub fn search_with_embedder(
         normalize_in_place(&mut query_vec);
     }
 
-    let scored = search_hnsw_at(hnsw_path, &query_vec, top_k, reader.symbol_count())
+    let scored = search_hnsw_at(hnsw_path, &query_vec, top_k, reader)
         .unwrap_or_else(|| search_brute_force(reader, &query_vec, top_k, normalized));
 
     let results = scored
@@ -71,24 +71,23 @@ pub fn search_with_embedder(
 /// v1.14.1 B1.1: the HNSW is keyed by `context_hash`, not by sym_idx.
 /// The handle loads the paired `index.hashes` sidecar (a sym_idx-
 /// ordered `Vec<u64>`) at open time and builds a `hash → sym_idx`
-/// map so `search()` can translate HNSW results back to the
+/// map so `search_with_aliases()` can translate HNSW results back to the
 /// `SymbolRecord` positions the rest of the codebase expects. Missing
 /// or mismatched sidecar → `open` returns None and callers degrade to
 /// brute-force, same path as a missing HNSW file.
 pub(crate) struct HnswHandle {
     index: usearch::Index,
-    hash_to_sym_idx: HashMap<u64, u32>,
+    hash_to_sym_indices: HashMap<u64, Vec<u32>>,
 }
 
 impl HnswHandle {
     /// Open the HNSW file at `hnsw_path` and prepare it for repeated
-    /// `search()` calls. Returns `None` for the same reasons
+    /// `search_with_aliases()` calls. Returns `None` for the same reasons
     /// `search_hnsw_at` previously returned `None`, plus the new
     /// v1.14.1 B1.1 cases:
     /// - HNSW file missing
     /// - index creation / view failed
     /// - the persisted index is empty
-    /// - the persisted index size disagrees with `expected_symbols`
     /// - the paired `index.hashes` sidecar is missing or malformed
     ///   (pre-1.14.1 indexes have no sidecar — re-run `vex index
     ///   --semantic` to upgrade)
@@ -130,15 +129,6 @@ impl HnswHandle {
             return None;
         }
 
-        if index.size() != expected_symbols {
-            tracing::warn!(
-                hnsw = index.size(),
-                symbols = expected_symbols,
-                "HNSW/index size mismatch — falling back to brute-force"
-            );
-            return None;
-        }
-
         // Load the hash-index sidecar that pairs HNSW hash-keys with
         // sym_idx positions. Sibling file `index.hashes`; if missing or
         // malformed the HNSW is unusable (we'd return correct top-k by
@@ -162,65 +152,83 @@ impl HnswHandle {
             return None;
         }
 
-        // Build the `hash → sym_idx` lookup. Hash collisions on
-        // xxh3_64 are astronomically improbable for random inputs, but
-        // a v1.14.1 update path keys symbols by hashes computed with
-        // `body_tokens: None` for reconstructed unchanged rows — two
-        // methods sharing `(kind, name, path, signature, doc)` would
-        // collide deterministically. `entry().or_insert` keeps the
-        // first sym_idx (matches usearch's `multi: false` behaviour
-        // where the first `add` wins), and the tracing line surfaces
-        // the anomaly so a real collision shows up in logs rather
-        // than as silent wrong refs.
-        let mut hash_to_sym_idx: HashMap<u64, u32> = HashMap::with_capacity(hashes.len());
-        let mut collisions: u32 = 0;
+        // Keep all symbol positions for each stored vector hash. Index
+        // building deduplicates equal hashes, so one HNSW key can name
+        // multiple symbol records.
+        let mut hash_to_sym_indices: HashMap<u64, Vec<u32>> = HashMap::with_capacity(hashes.len());
         for (i, h) in hashes.into_iter().enumerate() {
-            use std::collections::hash_map::Entry;
-            match hash_to_sym_idx.entry(h) {
-                Entry::Vacant(v) => {
-                    v.insert(i as u32);
-                }
-                Entry::Occupied(_) => collisions += 1,
-            }
+            hash_to_sym_indices.entry(h).or_default().push(i as u32);
         }
-        if collisions > 0 {
+        if !hash_index::matches_hnsw(&index, query_dim, hash_to_sym_indices.keys()) {
             tracing::warn!(
-                hnsw = %hnsw_path.display(),
-                collisions,
-                "HNSW hash-index sidecar has duplicate hashes — first sym_idx wins; \
-                 typically a `body_tokens: None` reconstructed-symbol collision"
+                hnsw = index.size(),
+                unique_hashes = hash_to_sym_indices.len(),
+                dimensions = index.dimensions(),
+                query_dim,
+                "HNSW dimension/key-set mismatch — falling back to brute-force"
             );
+            return None;
         }
+
+        tracing::debug!(
+            symbols = expected_symbols,
+            unique_vectors = index.size(),
+            aliases = expected_symbols - index.size(),
+            "HNSW index opened"
+        );
 
         Some(Self {
             index,
-            hash_to_sym_idx,
+            hash_to_sym_indices,
         })
     }
 
-    /// Query the opened index. Returns `None` only if usearch reports
-    /// a search error; an empty result set is `Some(Vec::new())`.
-    ///
-    /// v1.14.1 B1.1: HNSW returns keys = `context_hash` values. We
-    /// translate each back to a sym_idx via the sidecar map. A hash
-    /// we don't recognize in the map is silently dropped — that's the
-    /// defensive path against an HNSW/sidecar drift that
-    /// `expected_symbols` checks at open didn't catch.
-    pub(crate) fn search(&self, query_vec: &[f32], top_k: usize) -> Option<Vec<(usize, f32)>> {
-        let results = self.index.search(query_vec, top_k).ok()?;
-        Some(
-            results
-                .keys
-                .iter()
-                .zip(results.distances.iter())
-                .filter_map(|(&key, &dist)| {
-                    let sym_idx = *self.hash_to_sym_idx.get(&key)?;
-                    // usearch cosine distance = 1 - similarity
-                    let similarity = (1.0 - dist).max(0.0);
-                    Some((sym_idx as usize, similarity))
+    /// Query distinct HNSW keys and expand each result to every symbol
+    /// position recorded for that key. Returns `None` on search failure
+    /// or a result key missing from the validated sidecar.
+    pub(crate) fn search_with_aliases(
+        &self,
+        query_vec: &[f32],
+        distinct_hash_limit: usize,
+        reader: &IndexReader,
+    ) -> Option<Vec<(usize, f32)>> {
+        if query_vec.len() != self.index.dimensions() {
+            return None;
+        }
+        if distinct_hash_limit == 0 {
+            return Some(Vec::new());
+        }
+        let results = self
+            .index
+            .search(query_vec, distinct_hash_limit.min(self.index.size()))
+            .ok()?;
+        let mut scored = Vec::new();
+        let mut graph_vector = vec![0.0; query_vec.len()];
+        for (&key, &dist) in results.keys.iter().zip(&results.distances) {
+            let aliases = self.hash_to_sym_indices.get(&key)?;
+            if self.index.get(key, &mut graph_vector).ok()? != 1
+                || aliases.iter().any(|&sym_idx| {
+                    reader
+                        .symbol(sym_idx as usize)
+                        .and_then(|rec| reader.vector(rec.vector_index))
+                        .is_none_or(|vector| vector != graph_vector)
                 })
-                .collect(),
-        )
+            {
+                tracing::warn!(
+                    key,
+                    "HNSW result vector does not match the current symbol mapping — falling back to brute-force"
+                );
+                return None;
+            }
+            let similarity = (1.0 - dist).max(0.0);
+            scored.extend(aliases.iter().map(|&idx| (idx as usize, similarity)));
+        }
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Some(scored)
     }
 }
 
@@ -230,10 +238,14 @@ impl HnswHandle {
 pub(crate) fn search_hnsw_at(
     hnsw_path: &Path,
     query_vec: &[f32],
-    top_k: usize,
-    expected_symbols: usize,
+    distinct_hash_limit: usize,
+    reader: &IndexReader,
 ) -> Option<Vec<(usize, f32)>> {
-    HnswHandle::open(hnsw_path, query_vec.len(), expected_symbols)?.search(query_vec, top_k)
+    HnswHandle::open(hnsw_path, query_vec.len(), reader.symbol_count())?.search_with_aliases(
+        query_vec,
+        distinct_hash_limit,
+        reader,
+    )
 }
 
 /// Brute-force cosine similarity over all stored vectors. O(N).
@@ -387,7 +399,7 @@ mod tests {
     #[test]
     fn hnsw_missing_returns_none() {
         let path = Path::new("/nonexistent/index.hnsw");
-        let query = vec![1.0, 2.0, 3.0];
-        assert!(search_hnsw_at(path, &query, 10, 100).is_none());
+        let query = [1.0, 2.0, 3.0];
+        assert!(HnswHandle::open(path, query.len(), 100).is_none());
     }
 }

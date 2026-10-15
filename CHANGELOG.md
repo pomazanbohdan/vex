@@ -12,6 +12,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Hierarchy edges resolve only against type symbols, preserving external and ambiguous parent handling.
 - Scoped search limits are applied after candidate fusion and filtering.
 - `tests-for` preserves same-named call sites by file and line.
+- **Semantic HNSW results** preserve aliases and reject stale hash-to-symbol mappings via a versioned sidecar; legacy mappings safely fall back to brute force.
+- **Malformed semantic HNSW files** fall back to brute force when bounded header checks detect truncated or inconsistent file bounds.
 
 ### Added
 
