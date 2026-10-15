@@ -33,6 +33,11 @@ def main():
     (project / "native.rs").write_text("pub fn native_control() {}\nfn native_caller() { native_control(); }\n", encoding="utf-8")
     source_hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in project.iterdir()}
     env = dict(os.environ)
+    sandbox_home = run_dir / "home"
+    sandbox_home.mkdir()
+    cache_base = run_dir / "platform-cache"
+    cache_base.mkdir()
+    env.update(HOME=str(sandbox_home), USERPROFILE=str(sandbox_home), LOCALAPPDATA=str(cache_base), XDG_CACHE_HOME=str(cache_base))
     if args.sdk:
         env["VEX_DART_SDK"] = str(args.sdk.resolve(strict=True))
     if args.expect == "after" and not env.get("VEX_DART_SDK"):

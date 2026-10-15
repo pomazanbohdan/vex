@@ -38,10 +38,11 @@ Tree-sitter core itself is currently pinned at `0.26`. The grammar version
 column lists the crate's caret range from `Cargo.toml`; the locked patch
 version is in `Cargo.lock`.
 
-Dart has AST-filtered textual refs and name-based call edges. It has no scope
-binder for `vex usages --strict` and does not resolve receiver types or imported
-Dart library identities. See [Dart support](DART_SUPPORT.md) for extraction and
-grammar boundaries.
+Dart's ordinary indexed refs use AST filtering and its call edges match names;
+these paths do not resolve receiver types or imported library identities.
+`vex usages --strict` uses the optional SDK Analysis Server backend for compiler
+resolution instead of a native scope binder. See [Dart support](DART_SUPPORT.md)
+for the SDK contract and grammar boundaries.
 
 ## How extension → language mapping works
 
