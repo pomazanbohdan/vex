@@ -24,6 +24,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`cargo binstall vex-search` / `vex-search-mcp`** download the prebuilt
   release binaries instead of compiling.
 
+### Fixed
+
+- Incremental updates preserve ordinary references from unchanged files,
+  including files without symbols; older indexes are refreshed before they
+  can be reported as current.
+
 ## [1.27.4] - 2026-10-06
 
 ### Fixed
