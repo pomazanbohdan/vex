@@ -81,10 +81,6 @@ fn write_graph(path: &Path, vectors: &[Vec<f32>], hashes: &[u64]) {
         .expect("build pre-baked HNSW graph");
 }
 
-fn rewrite_hashes(path: &Path, hashes: &[u64]) {
-    hash_index::save(&path.with_file_name("index.hashes"), hashes).expect("rewrite hash sidecar");
-}
-
 fn symbol_hashes(files: &[ParsedFile]) -> Vec<u64> {
     files
         .iter()
@@ -136,10 +132,13 @@ fn hnsw_rejects_foreign_graph() {
     let files = parsed(&[("alpha", 1, "alpha"), ("beta", 2, "beta")]);
     let vectors = vec![one_hot(0), one_hot(1)];
     write_index(&index_path, &files, &vectors);
+    write_graph(&hnsw_path, &vectors, &symbol_hashes(&files));
+    let sidecar_path = hnsw_path.with_file_name("index.hashes");
+    let bound_sidecar = std::fs::read(&sidecar_path).unwrap();
     // Same dimensions/cardinality, foreign graph keys, and the current
     // symbol sidecar. The graph must be rejected and search rebuilt.
     write_graph(&hnsw_path, &[one_hot(1), one_hot(0)], &[91, 92]);
-    rewrite_hashes(&hnsw_path, &symbol_hashes(&files));
+    std::fs::write(&sidecar_path, bound_sidecar).unwrap();
     let reader = IndexReader::open(&index_path).unwrap();
 
     let results =

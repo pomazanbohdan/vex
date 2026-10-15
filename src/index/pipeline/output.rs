@@ -2459,6 +2459,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hnsw_bound_mapping_rejects_foreign_graph_keys() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_path = tmp.path().join("index.vex");
+        let hnsw_path = tmp.path().join("index.hnsw");
+        let sidecar_path = tmp.path().join("index.hashes");
+        let dim = MINILM_DIM as usize;
+        let mut vector = vec![0.0_f32; dim];
+        vector[0] = 1.0;
+        let parsed = vec![ParsedFile {
+            path: "fixture.rs".into(),
+            symbols: vec![mk_sym("current_processor", 1)],
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(
+            &parsed,
+            std::slice::from_ref(&vector),
+            dim as u32,
+            &index_path,
+        )
+        .unwrap();
+        let hashes = compute_hashes_for(&parsed, MINILM_ID).unwrap();
+        build_hnsw_at(
+            &hnsw_path,
+            &sidecar_path,
+            std::slice::from_ref(&vector),
+            &hashes,
+        )
+        .unwrap();
+        let reader = crate::store::reader::IndexReader::open(&index_path).unwrap();
+        assert!(crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader).is_some());
+        let bound_sidecar = std::fs::read(&sidecar_path).unwrap();
+        build_hnsw_at(&hnsw_path, &sidecar_path, &[vector], &[hashes[0] ^ 1]).unwrap();
+        std::fs::write(&sidecar_path, bound_sidecar).unwrap();
+        assert_eq!(
+            crate::search::hash_index::load_bound(&sidecar_path, &reader).unwrap(),
+            hashes
+        );
+        assert!(crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader).is_none());
+    }
+
     // ---- v1.15.0 B1.2 incremental HNSW tests ----
 
     /// Build a fixture HNSW with two synthetic vectors, then add/remove
