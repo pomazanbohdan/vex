@@ -30,8 +30,8 @@ fn cache_get(path: &Path) -> Option<[f32; 384]> {
         return None;
     }
     let mut vector = [0.0; 384];
-    for (value, chunk) in vector.iter_mut().zip(bytes.chunks_exact(4)) {
-        *value = f32::from_le_bytes(chunk.try_into().ok()?);
+    for (value, chunk) in vector.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        *value = f32::from_le_bytes(*chunk);
     }
     valid(&vector).then_some(vector)
 }
