@@ -26,7 +26,11 @@ fn directory_separator_filters_find_only_the_selected_directory() {
         assert_eq!(hits.len(), 1, "filter {filter:?}: {hits:?}");
         assert_eq!(
             hits[0].path,
-            Path::new("src").join("api").join("routes.py").to_str().unwrap()
+            Path::new("src")
+                .join("api")
+                .join("routes.py")
+                .to_str()
+                .unwrap()
         );
         assert_eq!(hits[0].line, 1);
         assert_eq!(hits[0].text, "needle");
@@ -56,7 +60,9 @@ fn unix_backslashes_in_filenames_remain_literal() {
     let hits = grep::search(tmp.path(), "needle", Some(r"literal\"), 100, &[], false).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].path, r"literal\name.py");
-    assert!(grep::search(tmp.path(), "needle", Some("literal/"), 100, &[], false)
-        .unwrap()
-        .is_empty());
+    assert!(
+        grep::search(tmp.path(), "needle", Some("literal/"), 100, &[], false)
+            .unwrap()
+            .is_empty()
+    );
 }

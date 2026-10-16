@@ -6,6 +6,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`grep --filter-path` on Windows** accepts forward, backward and mixed
+  path separators while preserving case-sensitive substring matching and
+  native paths in results.
+
 ### Added
 
 - **`install.sh`**: `curl -fsSL https://raw.githubusercontent.com/tenatarika/vex/main/install.sh | sh`
