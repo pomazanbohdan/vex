@@ -8,15 +8,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- Strict usages now match complete native symbol names case-insensitively.
-- Hierarchy edges resolve only against type symbols, preserving external and ambiguous parent handling.
 - Scoped search limits are applied after candidate fusion and filtering.
 - `tests-for` preserves same-named call sites by file and line.
-- **Semantic HNSW results** preserve aliases and reject stale hash-to-symbol mappings via a versioned sidecar; legacy mappings safely fall back to brute force.
-- **Malformed semantic HNSW files** fall back to brute force when bounded header checks detect truncated or inconsistent file bounds.
-- Incremental updates preserve ordinary references from unchanged files,
-  including files without symbols; older indexes are refreshed before they
-  can be reported as current.
 
 ### Added
 
@@ -27,10 +20,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   It refuses musl and glibc older than 2.34 with a pointer to a source build.
 - **`cargo binstall vex-search` / `vex-search-mcp`** download the prebuilt
   release binaries instead of compiling.
-
-### Fixed
-
-- Scoped search limits are applied after candidate fusion and filtering.
 
 ## [1.27.4] - 2026-10-06
 
