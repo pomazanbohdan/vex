@@ -22,6 +22,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`cargo binstall vex-search` / `vex-search-mcp`** download the prebuilt
   release binaries instead of compiling.
 - **Incremental parser-revision migration** retains semantic vectors only when model, dimension and exact context identity are validated.
+- Repeated MiniLM semantic queries reuse bounded, integrity-gated raw vectors.
 
 ## [1.27.4] - 2026-10-06
 

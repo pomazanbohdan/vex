@@ -16,6 +16,10 @@ use crate::store::reader::IndexReader;
 /// when `true`, the stored vectors are unit-length and the brute-force
 /// fallback uses dot product instead of full cosine. The query vector
 /// is normalized here so it matches.
+#[allow(
+    dead_code,
+    reason = "public library API; CLI already has its query vector"
+)]
 pub fn search_with_embedder(
     reader: &IndexReader,
     embedder: &mut dyn Embedder,
@@ -24,7 +28,17 @@ pub fn search_with_embedder(
     hnsw_path: &Path,
     normalized: bool,
 ) -> Result<Vec<SearchResult>> {
-    let mut query_vec = embedder.embed(query).context("embed query")?;
+    let query_vec = embedder.embed(query).context("embed query")?;
+    search_with_vector(reader, query_vec, top_k, hnsw_path, normalized)
+}
+
+pub(crate) fn search_with_vector(
+    reader: &IndexReader,
+    mut query_vec: Vec<f32>,
+    top_k: usize,
+    hnsw_path: &Path,
+    normalized: bool,
+) -> Result<Vec<SearchResult>> {
     if normalized {
         normalize_in_place(&mut query_vec);
     }

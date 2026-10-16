@@ -417,16 +417,16 @@ fn produce_results(
             );
         }
         check_embedder_match(root, &embedder_id)?;
-        let mut embedder =
-            crate::embed::make_embedder(&embedder_id).context("load embedding model")?;
+        let normalized = manifest.vectors_normalized.unwrap_or(false);
+        let query_vector =
+            crate::embed::query_cache::query_vector(&embedder_id, normalized, query)?;
         let hnsw_path = config::hnsw_path(root);
-        let semantic_results = semantic::search_with_embedder(
+        let semantic_results = semantic::search_with_vector(
             &reader,
-            embedder.as_mut(),
-            query,
+            query_vector,
             fetch_limit,
             &hnsw_path,
-            manifest.vectors_normalized.unwrap_or(false),
+            normalized,
         )?;
         if want_prefusion {
             trace_semantic = semantic_results.clone();
