@@ -59,13 +59,15 @@ fn target_refs(root: &Path) -> Vec<(String, u32)> {
 fn target_refs_at(path: &Path) -> Vec<(String, u32)> {
     let reader = IndexReader::open(path).unwrap();
     let paths = reader.file_paths();
-    reader
+    let mut refs: Vec<_> = reader
         .ref_reader()
         .unwrap()
         .find("target_processor")
         .into_iter()
         .map(|r| (paths[r.file_id as usize].clone(), r.line))
-        .collect()
+        .collect();
+    refs.sort_unstable();
+    refs
 }
 
 fn current_marker() -> [u8; 6] {
