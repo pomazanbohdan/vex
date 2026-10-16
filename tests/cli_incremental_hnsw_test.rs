@@ -30,6 +30,7 @@ use vex::index::pipeline::build_hnsw_at;
 use vex::index::symbols::{ParsedFile, ParsedSymbol, SymbolKind};
 use vex::search::hash_index;
 use vex::store::body_tokens;
+use vex::store::reader::IndexReader;
 use vex::store::writer::write_index_full;
 
 /// Unit vector of dimension `dim` with `1.0` at slot `slot` — orthogonal
@@ -254,15 +255,42 @@ fn vex_update_semantic_with_one_added_file_takes_incremental_hnsw_path() {
         "small-add update tripped tombstone fallback: {stderr}"
     );
 
-    // The hash-index sidecar must now carry both hashes in sym_idx
-    // order (alpha at 0, beta at 1) — proves the post-incremental
-    // rewrite in `build_hnsw_incremental_at` worked.
+    // Resolve the sidecar expectation from persisted sym_idx order; file
+    // discovery order is platform-dependent. Keep the hash comparison exact.
     let h_alpha = hash_for("function", "alpha", "src/alpha.rs", Some("alpha"));
     let h_beta = hash_for("function", "beta", "src/beta.rs", Some("beta"));
+    let index = IndexReader::open(&cache_root.join("index.vex")).expect("post-update index");
+    assert_eq!(index.symbol_count(), 2, "fixture must retain both symbols");
+    let mut names = Vec::with_capacity(index.symbol_count());
+    let expected: Vec<u64> = (0..index.symbol_count())
+        .map(|sym_idx| {
+            let record = index.symbol(sym_idx).expect("symbol row");
+            let name = index.read_string(record.name_offset);
+            let path = index.read_string(record.file_offset);
+            names.push(name);
+            let (hash, vector_slot) = match (name, path) {
+                ("alpha", "src/alpha.rs") => (h_alpha, 0),
+                ("beta", "src/beta.rs") => (h_beta, 1),
+                other => panic!("unexpected persisted symbol row {sym_idx}: {other:?}"),
+            };
+            let expected_vector = one_hot(vector_slot);
+            assert_eq!(
+                index.vector(record.vector_index).expect("symbol vector"),
+                expected_vector.as_slice(),
+                "persisted vector must match symbol at sym_idx {sym_idx}"
+            );
+            hash
+        })
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["alpha", "beta"],
+        "each fixture symbol must occur once"
+    );
     let loaded = hash_index::load(&cache_root.join("index.hashes")).expect("hash-index load");
     assert_eq!(
-        loaded,
-        vec![h_alpha, h_beta],
+        loaded, expected,
         "post-update hash-index sidecar must reflect new sym_idx layout"
     );
 
