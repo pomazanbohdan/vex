@@ -9,12 +9,28 @@ use vex::store::{body_tokens, reader::IndexReader, writer::write_index_full};
 use vex::util::config;
 
 fn legacy_embedded_index(root: &Path, embedder_id: &str, dimension: u32) -> Vec<f32> {
-    std::fs::create_dir_all(root).unwrap();
-    std::fs::write(
-        root.join("sample.rs"),
+    legacy_embedded_index_with(
+        root,
+        embedder_id,
+        dimension,
         "pub fn reuse_target() { let value = 7; }\n",
+        false,
+        None,
+        false,
     )
-    .unwrap();
+}
+
+fn legacy_embedded_index_with(
+    root: &Path,
+    embedder_id: &str,
+    dimension: u32,
+    source: &str,
+    duplicate_old_identity: bool,
+    context_doc: Option<&str>,
+    nonfinite_vector: bool,
+) -> Vec<f32> {
+    std::fs::create_dir_all(root).unwrap();
+    std::fs::write(root.join("sample.rs"), source).unwrap();
     let opts = IndexOptions {
         with_embeddings: false,
         with_clusters: false,
@@ -25,7 +41,10 @@ fn legacy_embedded_index(root: &Path, embedder_id: &str, dimension: u32) -> Vec<
 
     let index_path = config::index_path(root);
     let reader = IndexReader::open(&index_path).unwrap();
-    assert_eq!(reader.symbol_count(), 1);
+    assert_eq!(
+        reader.symbol_count(),
+        if duplicate_old_identity { 2 } else { 1 }
+    );
     let record = reader.symbol(0).unwrap();
     let symbol = vex::index::symbols::ParsedSymbol {
         name: reader.read_string(record.name_offset).to_string(),
@@ -44,21 +63,30 @@ fn legacy_embedded_index(root: &Path, embedder_id: &str, dimension: u32) -> Vec<
         &symbol.name,
         "sample.rs",
         symbol.signature.as_deref(),
-        None,
+        context_doc,
         symbol.body_tokens.as_deref(),
         embedder_char_budget(embedder_id).unwrap(),
     );
-    let vector = (0..dimension)
+    let mut vector = (0..dimension)
         .map(|i| match i {
             0 => 1.0,
             1 => -0.0,
             _ => 0.0,
         })
         .collect::<Vec<_>>();
+    if nonfinite_vector {
+        vector[0] = f32::NAN;
+    }
+    let symbols = if duplicate_old_identity {
+        vec![symbol.clone(), symbol]
+    } else {
+        vec![symbol]
+    };
+    let vectors = vec![vector.clone(); symbols.len()];
     write_index_full(
         &[vex::index::symbols::ParsedFile {
             path: "sample.rs".to_string(),
-            symbols: vec![symbol],
+            symbols,
             refs: Vec::new(),
             call_edges: Vec::new(),
             bound_refs: Vec::new(),
@@ -67,14 +95,14 @@ fn legacy_embedded_index(root: &Path, embedder_id: &str, dimension: u32) -> Vec<
             trigram_bloom: None,
             hierarchy_captures: Vec::new(),
         }],
-        std::slice::from_ref(&vector),
+        &vectors,
         dimension,
         &index_path,
     )
     .unwrap();
     vex::search::hash_index::save(
         &config::hash_index_path(root),
-        &[context_hash(embedder_id, &context)],
+        &vec![context_hash(embedder_id, &context); vectors.len()],
     )
     .unwrap();
     let mut manifest = Manifest::load(&config::manifest_path(root)).unwrap();
@@ -83,6 +111,23 @@ fn legacy_embedded_index(root: &Path, embedder_id: &str, dimension: u32) -> Vec<
     manifest.save(&config::manifest_path(root)).unwrap();
     std::fs::remove_file(config::index_dir(root).join("index.parse-revision")).unwrap();
     vector
+}
+
+fn assert_readable_without_reused_vectors(root: &Path, expected_symbols: usize) {
+    let reader = IndexReader::open(&config::index_path(root)).unwrap();
+    assert_eq!(reader.symbol_count(), expected_symbols);
+    for index in 0..reader.symbol_count() {
+        assert!(reader
+            .vector(reader.symbol(index).unwrap().vector_index)
+            .is_none());
+    }
+    assert_eq!(
+        Manifest::load(&config::manifest_path(root))
+            .unwrap()
+            .embedder_id,
+        None,
+        "refusal must not label structural output with the old model"
+    );
 }
 
 #[test]
@@ -313,4 +358,85 @@ fn migration_rejects_unmarked_vector_normalization() {
             .embedder_id,
         None
     );
+}
+
+#[test]
+fn migration_refuses_ambiguous_name_kind_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let id = "minilm-l6-v2";
+    let source =
+        "pub fn reuse_target() { let value = 7; }\npub fn reuse_target() { let value = 7; }\n";
+    legacy_embedded_index_with(
+        &root,
+        id,
+        embedder_dim(id).unwrap(),
+        source,
+        true,
+        None,
+        false,
+    );
+
+    let opts = IndexOptions {
+        with_embeddings: false,
+        with_clusters: false,
+        with_pattern_index: false,
+        ..IndexOptions::default()
+    };
+    pipeline::update(&root, opts, "different-configured-model", &[]).unwrap();
+
+    assert_readable_without_reused_vectors(&root, 2);
+}
+
+#[test]
+fn migration_refuses_context_that_depended_on_unpersisted_docs() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let id = "minilm-l6-v2";
+    let source = "/// persisted doc\npub fn reuse_target() { let value = 7; }\n";
+    legacy_embedded_index_with(
+        &root,
+        id,
+        embedder_dim(id).unwrap(),
+        source,
+        false,
+        Some("persisted doc"),
+        false,
+    );
+
+    let opts = IndexOptions {
+        with_embeddings: false,
+        with_clusters: false,
+        with_pattern_index: false,
+        ..IndexOptions::default()
+    };
+    pipeline::update(&root, opts, "different-configured-model", &[]).unwrap();
+
+    assert_readable_without_reused_vectors(&root, 1);
+}
+
+#[test]
+fn migration_refuses_nonfinite_persisted_vector() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let id = "minilm-l6-v2";
+    legacy_embedded_index_with(
+        &root,
+        id,
+        embedder_dim(id).unwrap(),
+        "pub fn reuse_target() { let value = 7; }\n",
+        false,
+        None,
+        true,
+    );
+
+    let opts = IndexOptions {
+        with_embeddings: false,
+        with_clusters: false,
+        with_pattern_index: false,
+        ..IndexOptions::default()
+    };
+    pipeline::update(&root, opts, "different-configured-model", &[]).unwrap();
+
+    assert_readable_without_reused_vectors(&root, 1);
 }
