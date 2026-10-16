@@ -6,8 +6,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Strict usages now match complete native symbol names case-insensitively.
+- Hierarchy edges resolve only against type symbols, preserving external and ambiguous parent handling.
+- Scoped search limits are applied after candidate fusion and filtering.
+- `tests-for` preserves same-named call sites by file and line.
+- **Semantic HNSW results** preserve aliases and reject stale hash-to-symbol mappings via a versioned sidecar; legacy mappings safely fall back to brute force.
+- **Malformed semantic HNSW files** fall back to brute force when bounded header checks detect truncated or inconsistent file bounds.
+- Incremental updates preserve ordinary references from unchanged files,
+  including files without symbols; older indexes are refreshed before they
+  can be reported as current.
+- **Semantic HNSW results** preserve aliases and reject stale hash-to-symbol mappings via a versioned sidecar; legacy mappings safely fall back to brute force.
+- **Malformed semantic HNSW files** fall back to brute force when bounded header checks detect truncated or inconsistent file bounds.
+
 ### Added
 
+- Add Dart indexing with the pinned Orchard grammar; supported syntax is limited to the constructs covered by extraction fixtures.
 - **`install.sh`**: `curl -fsSL https://raw.githubusercontent.com/tenatarika/vex/main/install.sh | sh`
   installs `vex` and `vex-mcp` from the latest release into `~/.local/bin`
   (macOS arm64, Linux x86_64; `VEX_VERSION`, `VEX_INSTALL_DIR`, `VEX_NO_MCP`).

@@ -2,6 +2,7 @@ use std::path::Path;
 
 use super::hasher::hash_file;
 use super::manifest::Manifest;
+use super::parse_revision;
 
 /// Result of a staleness check.
 #[derive(Debug)]
@@ -22,6 +23,13 @@ pub enum Freshness {
 /// ls-files) to count changed files. When false, only compares HEAD — a single
 /// subprocess call.
 pub fn check(root: &Path, manifest: &Manifest, deep: bool) -> Freshness {
+    if crate::util::config::index_path(root).exists()
+        && !parse_revision::is_current(&crate::util::config::index_dir(root))
+    {
+        return Freshness::Stale {
+            changed_count: None,
+        };
+    }
     if let Some(ref saved_head) = manifest.git_head {
         if let Some(f) = check_git(root, saved_head, deep) {
             return f;

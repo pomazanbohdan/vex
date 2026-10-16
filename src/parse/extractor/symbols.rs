@@ -129,7 +129,7 @@ pub(crate) fn extract_symbols_and_imports_with_tree(
                 _ => continue,
             };
 
-            let parent = node.parent();
+            let parent = definition_node(node, lang, kind);
             let signature = parent.map(|p| {
                 let start = p.start_byte();
                 let mut end = (start + 200).min(content.len());
@@ -160,6 +160,36 @@ pub(crate) fn extract_symbols_and_imports_with_tree(
     }
 
     Ok((symbols, imports))
+}
+
+fn definition_node(
+    node: tree_sitter::Node<'_>,
+    lang: Language,
+    kind: SymbolKind,
+) -> Option<tree_sitter::Node<'_>> {
+    let parent = node.parent();
+    if lang != Language::Dart || !matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+        return parent;
+    }
+    let mut current = parent;
+    while let Some(ancestor) = current {
+        match ancestor.kind() {
+            "function_declaration"
+            | "method_declaration"
+            | "class_definition"
+            | "enum_declaration"
+            | "mixin_declaration"
+            | "extension_declaration"
+            | "extension_type_declaration"
+            | "type_alias"
+            | "declaration" => {
+                return Some(ancestor);
+            }
+            "program" | "class_body" => break,
+            _ => current = ancestor.parent(),
+        }
+    }
+    parent
 }
 
 /// Strip a single layer of matching surrounding quote-pair delimiters from

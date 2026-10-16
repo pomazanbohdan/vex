@@ -84,6 +84,10 @@ pub const MAGIC: &[u8; 4] = b"VXBC";
 ///   fields on a struct-shape change like this. Treating v4 as a miss
 ///   forces a one-time re-parse, after which v5 entries carry
 ///   `hierarchy_captures` for free on every hit.
+///
+/// The private `index.parse-revision` marker versions index carry behavior,
+/// not this serialized payload. Revisions that only change carry semantics
+/// reuse valid cache entries and do not bump this value.
 pub const CACHE_FORMAT_VERSION: u16 = 5;
 
 /// On-disk header size: 4 (magic) + 2 (version) + 4 (fingerprint).

@@ -2,7 +2,7 @@
 //! from `<TARGET>` (same BFS as `vex reachable`), then post-filter the
 //! result set down to test functions:
 //!   1. path matches the test-glob set (default OR `--test-pattern`),
-//!   2. (unless `--include-fixtures`) name passes Signal-B heuristic,
+//!   2. (unless `--include-fixtures`) name looks like a test or is Dart `main`,
 //!   3. stamp `framework` label from the path bucket.
 //!
 //! Empty result set → exit 1 (mirrors `vex reachable`).
@@ -15,9 +15,7 @@ use super::common::{resolve_root, CmdCtx};
 use super::index_management::ensure_index_ready;
 use super::output::{self, TestsForRow};
 use super::scope;
-use crate::callgraph::test_patterns::{
-    build_test_globset, framework_for_path, looks_like_test_name,
-};
+use crate::callgraph::test_patterns::{build_test_globset, framework_for_path, is_test_entry_name};
 use crate::store::reader::IndexReader;
 
 /// Match against the (possibly user-supplied) `--test-pattern` set, with
@@ -80,7 +78,7 @@ pub(crate) fn tests_for(
         .iter()
         .filter(|m| path_scope.accept(&m.path))
         .filter(|m| is_test_match(&test_globset, &m.path))
-        .filter(|m| include_fixtures || looks_like_test_name(&m.name))
+        .filter(|m| include_fixtures || is_test_entry_name(&m.name, &m.path))
         .map(|m| TestsForRow {
             framework: framework_for_path(&m.path),
             name: m.name.clone(),
@@ -90,15 +88,11 @@ pub(crate) fn tests_for(
         })
         .collect();
 
-    // `--include-fixtures` semantic: in addition to weakening Signal-B,
-    // expand one hop forward from each surviving test row and surface
-    // any callee that lives in a test path. This is the "test cluster"
-    // view — fixtures used by tests are part of the answer to "which
-    // tests cover this code?". Bounded by `limit`; deduped by name.
     if include_fixtures && rows.len() < limit {
-        let mut seen: std::collections::HashSet<String> =
-            rows.iter().map(|r| r.name.clone()).collect();
-        seen.insert(target.clone());
+        let mut seen_sites: std::collections::HashSet<(String, String, usize)> = rows
+            .iter()
+            .map(|r| (r.name.clone(), r.path.clone(), r.line))
+            .collect();
         let mut extra: Vec<TestsForRow> = Vec::new();
         'outer: for r in &rows {
             // Stop fetching callees once we already have enough rows
@@ -116,10 +110,13 @@ pub(crate) fn tests_for(
                 if rows.len() + extra.len() >= limit {
                     break 'outer;
                 }
-                if !seen.insert(c.name.clone()) {
+                if c.name == target {
                     continue;
                 }
                 if !path_scope.accept(&c.path) || !is_test_match(&test_globset, &c.path) {
+                    continue;
+                }
+                if !seen_sites.insert((c.name.clone(), c.path.clone(), c.line)) {
                     continue;
                 }
                 extra.push(TestsForRow {

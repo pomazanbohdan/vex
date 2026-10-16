@@ -131,7 +131,7 @@ fn walk_for_refs(
         return;
     }
 
-    if is_identifier_kind(kind) {
+    if is_identifier_kind(kind) || (lang == Language::Dart && kind == "identifier_dollar_escaped") {
         let text = node.node_text(content.as_bytes());
         if is_meaningful_identifier(text) {
             let line = node.start_position().row + 1;
@@ -160,6 +160,7 @@ fn is_comment_kind(kind: &str, lang: Language) -> bool {
         Language::Go => kind == "comment",
         Language::Java => matches!(kind, "line_comment" | "block_comment"),
         Language::Kotlin => matches!(kind, "line_comment" | "block_comment"),
+        Language::Dart => matches!(kind, "comment" | "line_comment" | "block_comment"),
         _ => false,
     }
 }
@@ -212,6 +213,7 @@ fn interpolation_child_kind(kind: &str, lang: Language) -> Option<&'static str> 
         (Language::Python, "string") => Some("interpolation"),
         (Language::CSharp, "interpolated_string_expression") => Some("interpolation"),
         (Language::Kotlin, "string_literal") => Some("interpolation"),
+        (Language::Dart, "string_literal") => Some("template_substitution"),
         _ => None,
     }
 }
@@ -308,6 +310,7 @@ mod tests {
             (Language::Lua, "lua"),
             (Language::Yaml, "yaml"),
             (Language::Toml, "toml"),
+            (Language::Dart, "dart"),
         ];
         assert_eq!(
             fixtures.len(),

@@ -17,9 +17,10 @@
 //!
 //! ```text
 //! magic:        4 bytes "VEXH"
-//! version:      u32 = 1
+//! version:      u32 = 1 (public/unbound) or 2 (private/bound)
 //! count:        u32 (number of hashes)
-//! data:         count × u64 (sym_idx-ordered)
+//! v2 digest:    u64 (ordered symbol-mapping evidence)
+//! data:         count × u64 (sym_idx-ordered; follows digest in v2)
 //! ```
 //!
 //! No `embedder_id` field — the embed cache (`embed/cache.rs`) already
@@ -27,18 +28,35 @@
 //! which carries the embedder's dimension in its own header. Magic /
 //! version mismatch on load → discard, fall back to brute force.
 
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
+use crate::store::reader::IndexReader;
 use anyhow::{Context, Result};
+use xxhash_rust::xxh3::Xxh3Default;
 
 const MAGIC: &[u8; 4] = b"VEXH";
-const VERSION: u32 = 1;
+const VERSION_V1: u32 = 1;
+const VERSION_V2: u32 = 2;
 
 /// Bound on the count field. ~10M symbols is past anything legitimate
 /// (a 384-dim f32 vector blob alone would be 15 GB at that scale). The
 /// reader bails before allocating against a crafted count.
 const MAX_COUNT: u32 = 10_000_000;
+
+pub(crate) fn matches_hnsw<'a>(
+    index: &usearch::Index,
+    expected_dim: usize,
+    unique_hashes: impl ExactSizeIterator<Item = &'a u64>,
+) -> bool {
+    index.dimensions() == expected_dim
+        && matches!(index.metric_kind(), usearch::MetricKind::Cos)
+        && index.size() > 0
+        && index.size() == unique_hashes.len()
+        && unique_hashes
+            .into_iter()
+            .all(|&hash| index.count(hash) == 1)
+}
 
 /// Atomic save: write to `.tmp`, then rename. Matches the convention
 /// used by `embed::cache::EmbedCache::save` and `store::writer` —
@@ -80,6 +98,25 @@ pub fn save(path: &Path, hashes: &[u64]) -> Result<()> {
 /// failure the tmp file may exist in a partial state; callers
 /// should treat any error as a "tmp leak" they need to clean up.
 pub fn save_to_tmp(tmp_path: &Path, hashes: &[u64]) -> Result<()> {
+    write_sidecar(tmp_path, hashes, None)
+}
+
+/// Write a private v2 sidecar bound to the ordered symbols in `reader`.
+pub(crate) fn save_bound_to_tmp(
+    tmp_path: &Path,
+    hashes: &[u64],
+    reader: &IndexReader,
+) -> Result<()> {
+    let digest = mapping_digest(reader, hashes)?;
+    write_sidecar(tmp_path, hashes, Some(digest))
+}
+
+fn write_sidecar(tmp_path: &Path, hashes: &[u64], digest: Option<u64>) -> Result<()> {
+    let version = if digest.is_some() {
+        VERSION_V2
+    } else {
+        VERSION_V1
+    };
     // Match the read-side `MAX_COUNT` guard so a truncating `as u32` cast
     // can't silently write a wrong count for an index past 10M symbols —
     // the cast would otherwise produce a sidecar that `load` accepts as
@@ -93,10 +130,14 @@ pub fn save_to_tmp(tmp_path: &Path, hashes: &[u64]) -> Result<()> {
     let mut file = std::fs::File::create(tmp_path)
         .with_context(|| format!("create {}", tmp_path.display()))?;
     file.write_all(MAGIC).context("write magic")?;
-    file.write_all(&VERSION.to_le_bytes())
+    file.write_all(&version.to_le_bytes())
         .context("write version")?;
     file.write_all(&(hashes.len() as u32).to_le_bytes())
         .context("write count")?;
+    if let Some(digest) = digest {
+        file.write_all(&digest.to_le_bytes())
+            .context("write symbol-mapping digest")?;
+    }
     for h in hashes {
         file.write_all(&h.to_le_bytes()).context("write hash")?;
     }
@@ -115,7 +156,26 @@ pub fn save_to_tmp(tmp_path: &Path, hashes: &[u64]) -> Result<()> {
 /// want "absence ≡ no sidecar" semantics should check `path.exists()`
 /// first.
 pub fn load(path: &Path) -> Result<Vec<u64>> {
-    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    read_sidecar(path).map(|(_, hashes, _)| hashes)
+}
+
+pub(crate) fn load_bound(path: &Path, reader: &IndexReader) -> Result<Vec<u64>> {
+    let (version, hashes, digest) = read_sidecar(path)?;
+    anyhow::ensure!(
+        version == VERSION_V2,
+        "hash-index mapping evidence is absent; re-run `vex index --semantic`"
+    );
+    let expected = mapping_digest(reader, &hashes)?;
+    anyhow::ensure!(
+        digest == Some(expected),
+        "hash-index symbol mapping mismatch; re-run `vex index --semantic`"
+    );
+    Ok(hashes)
+}
+
+fn read_sidecar(path: &Path) -> Result<(u32, Vec<u64>, Option<u64>)> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut file = BufReader::new(file);
 
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic).context("read magic")?;
@@ -124,8 +184,8 @@ pub fn load(path: &Path) -> Result<Vec<u64>> {
     }
 
     let version = read_u32(&mut file).context("read version")?;
-    if version != VERSION {
-        anyhow::bail!("hash-index version mismatch: {} != {}", version, VERSION);
+    if version != VERSION_V1 && version != VERSION_V2 {
+        anyhow::bail!("hash-index version mismatch: {} not in [1, 2]", version);
     }
 
     let count = read_u32(&mut file).context("read count")?;
@@ -133,11 +193,47 @@ pub fn load(path: &Path) -> Result<Vec<u64>> {
         anyhow::bail!("hash-index count absurd: {} > {}", count, MAX_COUNT);
     }
 
+    let digest = if version == VERSION_V2 {
+        Some(read_u64(&mut file).context("read symbol-mapping digest")?)
+    } else {
+        None
+    };
+
     let mut hashes: Vec<u64> = Vec::with_capacity(count as usize);
     for _ in 0..count {
         hashes.push(read_u64(&mut file).context("read hash")?);
     }
-    Ok(hashes)
+    Ok((version, hashes, digest))
+}
+
+fn mapping_digest(reader: &IndexReader, hashes: &[u64]) -> Result<u64> {
+    anyhow::ensure!(
+        hashes.len() == reader.symbol_count(),
+        "hash-index count {} disagrees with index symbol count {}",
+        hashes.len(),
+        reader.symbol_count()
+    );
+    let mut hasher = Xxh3Default::new();
+    hasher.update(&(hashes.len() as u64).to_le_bytes());
+    hasher.update(&reader.header().vector_dim.to_le_bytes());
+    for (idx, &hash) in hashes.iter().enumerate() {
+        let record = reader
+            .symbol(idx)
+            .with_context(|| format!("missing symbol record {idx} while binding hash sidecar"))?;
+        hasher.update(&hash.to_le_bytes());
+        hasher.update(&[record.kind]);
+        hasher.update(&record.line.to_le_bytes());
+        hasher.update(&record.vector_index.to_le_bytes());
+        update_string(&mut hasher, reader.read_string(record.file_offset));
+        update_string(&mut hasher, reader.read_string(record.name_offset));
+        update_string(&mut hasher, reader.read_string(record.signature_offset));
+    }
+    Ok(hasher.digest())
+}
+
+fn update_string(hasher: &mut Xxh3Default, value: &str) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
 }
 
 /// Fuzzing shim — exposed only to `vex-fuzz`. Writes `data` as a
@@ -223,7 +319,7 @@ mod tests {
         let p = tmp.path().join("h.bin");
         let mut bad = Vec::new();
         bad.extend_from_slice(b"NOPE");
-        bad.extend_from_slice(&VERSION.to_le_bytes());
+        bad.extend_from_slice(&VERSION_V1.to_le_bytes());
         bad.extend_from_slice(&0u32.to_le_bytes());
         std::fs::write(&p, bad).unwrap();
         assert!(load(&p).is_err());
@@ -242,6 +338,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_truncated_v2_mapping_header() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("h.bin");
+        let mut bad = Vec::new();
+        bad.extend_from_slice(MAGIC);
+        bad.extend_from_slice(&VERSION_V2.to_le_bytes());
+        bad.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&p, bad).unwrap();
+        assert!(load(&p).is_err());
+    }
+
+    #[test]
     fn rejects_absurd_count() {
         // A crafted count past `MAX_COUNT` would allocate a huge Vec
         // before reading the body fails — bail at the header instead.
@@ -249,7 +357,7 @@ mod tests {
         let p = tmp.path().join("h.bin");
         let mut bad = Vec::new();
         bad.extend_from_slice(MAGIC);
-        bad.extend_from_slice(&VERSION.to_le_bytes());
+        bad.extend_from_slice(&VERSION_V1.to_le_bytes());
         bad.extend_from_slice(&(MAX_COUNT + 1).to_le_bytes());
         std::fs::write(&p, bad).unwrap();
         assert!(load(&p).is_err());
@@ -264,7 +372,7 @@ mod tests {
         let p = tmp.path().join("h.bin");
         let mut bad = Vec::new();
         bad.extend_from_slice(MAGIC);
-        bad.extend_from_slice(&VERSION.to_le_bytes());
+        bad.extend_from_slice(&VERSION_V1.to_le_bytes());
         bad.extend_from_slice(&3u32.to_le_bytes());
         bad.extend_from_slice(&42u64.to_le_bytes());
         std::fs::write(&p, bad).unwrap();

@@ -1548,7 +1548,28 @@ pub(super) fn compute_hashes_for(parsed: &[ParsedFile], embedder_id: &str) -> Re
 pub(super) fn build_hnsw(root: &Path, vectors: &[Vec<f32>], hashes: &[u64]) -> Result<()> {
     let hnsw_path = config::hnsw_path(root);
     let hash_index_path = config::hash_index_path(root);
+    // A shorter vector prefix is a valid partial-semantic state; the
+    // public `_at` helper keeps rejecting every cardinality mismatch.
+    if vectors.len() < hashes.len() {
+        remove_hnsw_pair(&hnsw_path, &hash_index_path)?;
+        tracing::debug!(
+            vectors = vectors.len(),
+            hashes = hashes.len(),
+            "HNSW build skipped for partial semantic vectors"
+        );
+        return Ok(());
+    }
     build_hnsw_at(&hnsw_path, &hash_index_path, vectors, hashes)
+}
+
+fn remove_hnsw_pair(hnsw_path: &Path, hash_index_path: &Path) -> Result<()> {
+    if hnsw_path.exists() {
+        std::fs::remove_file(hnsw_path).context("remove stale HNSW index")?;
+    }
+    if hash_index_path.exists() {
+        std::fs::remove_file(hash_index_path).context("remove stale HNSW hash-index sidecar")?;
+    }
+    Ok(())
 }
 
 // v1.15.0 B1.2 — `build_hnsw_at` and `build_hnsw_incremental_at` are
@@ -1605,7 +1626,22 @@ fn commit_hnsw_and_sidecar(
     index
         .save(hnsw_tmp_str)
         .with_context(|| format!("save HNSW to {}", hnsw_tmp.display()))?;
-    if let Err(e) = crate::search::hash_index::save_to_tmp(&hash_tmp, hashes) {
+    let index_path = hnsw_path.with_file_name("index.vex");
+    let sidecar_result = match index_path.try_exists() {
+        Ok(true) => crate::store::reader::IndexReader::open(&index_path)
+            .with_context(|| {
+                format!(
+                    "open sibling index {} for HNSW mapping",
+                    index_path.display()
+                )
+            })
+            .and_then(|reader| {
+                crate::search::hash_index::save_bound_to_tmp(&hash_tmp, hashes, &reader)
+            }),
+        Ok(false) => crate::search::hash_index::save_to_tmp(&hash_tmp, hashes),
+        Err(e) => Err(e).with_context(|| format!("inspect sibling index {}", index_path.display())),
+    };
+    if let Err(e) = sidecar_result {
         // Sidecar tmp failed → HNSW tmp leaked; clean it up before
         // returning so the next run starts from a clean state.
         let _ = std::fs::remove_file(&hnsw_tmp);
@@ -1848,6 +1884,14 @@ pub(super) fn build_hnsw_incremental(
 ) -> Result<bool> {
     let hnsw_path = config::hnsw_path(root);
     let hash_index_path = config::hash_index_path(root);
+    if new_vectors.len() < new_hashes.len() {
+        tracing::debug!(
+            vectors = new_vectors.len(),
+            hashes = new_hashes.len(),
+            "incremental HNSW skipped for partial semantic vectors"
+        );
+        return Ok(false);
+    }
     build_hnsw_incremental_at(&hnsw_path, &hash_index_path, new_vectors, new_hashes)
 }
 
@@ -2193,7 +2237,7 @@ pub fn __fuzz_incremental_hnsw_bytes(data: &[u8]) {
 mod tests {
     use super::*;
     use crate::embed::{cache::context_hash, MINILM_CHAR_BUDGET, MINILM_DIM, MINILM_ID};
-    use crate::index::symbols::{ParsedSymbol, SymbolKind};
+    use crate::index::symbols::{ParsedFile, ParsedSymbol, SymbolKind};
 
     fn mk_sym(name: &str, line: usize) -> ParsedSymbol {
         ParsedSymbol {
@@ -2322,6 +2366,26 @@ mod tests {
         let h_foo: u64 = 0xFEED_C0FF_EEC0_DE42;
         let h_bar: u64 = 0x00BA_0BAB_DEAD_BEEF;
 
+        let index_path = tmp.path().join("index.vex");
+        let parsed = vec![ParsedFile {
+            path: "fixture.rs".into(),
+            symbols: vec![mk_sym("foo", 1), mk_sym("bar", 2)],
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(
+            &parsed,
+            &[v_foo.clone(), v_bar.clone()],
+            dim as u32,
+            &index_path,
+        )
+        .unwrap();
+        let reader = crate::store::reader::IndexReader::open(&index_path).unwrap();
         build_hnsw_at(
             &hnsw_path,
             &hash_index_path,
@@ -2335,19 +2399,140 @@ mod tests {
         assert!(hnsw_path.exists(), "HNSW file must exist");
         assert!(hash_index_path.exists(), "hash-index sidecar must exist");
 
-        // Open the handle: expected_symbols = 2 (matches both HNSW size
-        // and sidecar length). Should succeed; missing sidecar would
+        // Open the handle against the current reader mapping. Should
+        // succeed; missing or unbound sidecar would
         // return None.
-        let handle =
-            crate::search::semantic::HnswHandle::open(&hnsw_path, dim, 2).expect("open HnswHandle");
+        let handle = crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader)
+            .expect("open HnswHandle");
 
         // Query with v_foo — top-1 must be sym_idx 0 with similarity
         // ~1.0 (the stored vector under hash h_foo).
-        let results = handle.search(&v_foo, 1).expect("search succeeds");
+        let results = handle
+            .search_with_aliases(&v_foo, 1, &reader)
+            .expect("search succeeds");
         assert_eq!(results.len(), 1);
         let (sym_idx, sim) = results[0];
         assert_eq!(sym_idx, 0, "top-1 must resolve to sym_idx 0 via hash map");
         assert!(sim > 0.99, "self-similarity should be ~1.0, got {sim}");
+    }
+
+    #[test]
+    fn hnsw_bound_mapping_rejects_reordered_equal_vectors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_path = tmp.path().join("index.vex");
+        let hnsw_path = tmp.path().join("index.hnsw");
+        let sidecar_path = tmp.path().join("index.hashes");
+        let dim = MINILM_DIM as usize;
+        let mut vector = vec![0.0_f32; dim];
+        vector[0] = 1.0;
+        let old = vec![ParsedFile {
+            path: "fixture.rs".into(),
+            symbols: vec![mk_sym("first", 1), mk_sym("second", 2)],
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(
+            &old,
+            &[vector.clone(), vector.clone()],
+            dim as u32,
+            &index_path,
+        )
+        .unwrap();
+        build_hnsw_at(
+            &hnsw_path,
+            &sidecar_path,
+            &[vector.clone(), vector.clone()],
+            &compute_hashes_for(&old, MINILM_ID).unwrap(),
+        )
+        .unwrap();
+
+        let reordered = vec![ParsedFile {
+            path: "fixture.rs".into(),
+            symbols: vec![mk_sym("second", 2), mk_sym("first", 1)],
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(
+            &reordered,
+            &[vector.clone(), vector.clone()],
+            dim as u32,
+            &index_path,
+        )
+        .unwrap();
+        let reader = crate::store::reader::IndexReader::open(&index_path).unwrap();
+        assert!(
+            crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader).is_none(),
+            "old mapping must fail even when distinct graph keys have identical vectors"
+        );
+
+        build_hnsw_at(
+            &hnsw_path,
+            &sidecar_path,
+            &[vector.clone(), vector.clone()],
+            &compute_hashes_for(&reordered, MINILM_ID).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader).is_some(),
+            "a correctly reordered v2 mapping opens"
+        );
+    }
+
+    #[test]
+    fn hnsw_bound_mapping_rejects_foreign_graph_keys() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_path = tmp.path().join("index.vex");
+        let hnsw_path = tmp.path().join("index.hnsw");
+        let sidecar_path = tmp.path().join("index.hashes");
+        let dim = MINILM_DIM as usize;
+        let mut vector = vec![0.0_f32; dim];
+        vector[0] = 1.0;
+        let parsed = vec![ParsedFile {
+            path: "fixture.rs".into(),
+            symbols: vec![mk_sym("current_processor", 1)],
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(
+            &parsed,
+            std::slice::from_ref(&vector),
+            dim as u32,
+            &index_path,
+        )
+        .unwrap();
+        let hashes = compute_hashes_for(&parsed, MINILM_ID).unwrap();
+        build_hnsw_at(
+            &hnsw_path,
+            &sidecar_path,
+            std::slice::from_ref(&vector),
+            &hashes,
+        )
+        .unwrap();
+        let reader = crate::store::reader::IndexReader::open(&index_path).unwrap();
+        assert!(crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader).is_some());
+        let bound_sidecar = std::fs::read(&sidecar_path).unwrap();
+        build_hnsw_at(&hnsw_path, &sidecar_path, &[vector], &[hashes[0] ^ 1]).unwrap();
+        std::fs::write(&sidecar_path, bound_sidecar).unwrap();
+        assert_eq!(
+            crate::search::hash_index::load_bound(&sidecar_path, &reader).unwrap(),
+            hashes
+        );
+        assert!(crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader).is_none());
     }
 
     // ---- v1.15.0 B1.2 incremental HNSW tests ----
@@ -2395,6 +2580,21 @@ mod tests {
 
         let v_new = vec![vec![1.0_f32; dim]];
         let h_new = vec![0xAA_u64];
+        let index_path = tmp.path().join("index.vex");
+        let parsed = vec![ParsedFile {
+            path: "fixture.rs".into(),
+            symbols: (0..v_new.len())
+                .map(|idx| mk_sym(&format!("sym_{idx}"), idx + 1))
+                .collect(),
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(&parsed, &v_new, dim as u32, &index_path).unwrap();
         let applied =
             build_hnsw_incremental_at(&hnsw_path, &hash_index_path, &v_new, &h_new).unwrap();
         assert!(!applied, "missing sidecar → fall back");
@@ -2476,6 +2676,22 @@ mod tests {
         v_new.push(v_added.clone());
         h_new.push(0x2000_u64);
 
+        let index_path = tmp.path().join("index.vex");
+        let parsed = vec![ParsedFile {
+            path: "fixture.rs".into(),
+            symbols: (0..v_new.len())
+                .map(|idx| mk_sym(&format!("sym_{idx}"), idx + 1))
+                .collect(),
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(&parsed, &v_new, dim as u32, &index_path).unwrap();
+
         let applied =
             build_hnsw_incremental_at(&hnsw_path, &hash_index_path, &v_new, &h_new).unwrap();
         assert!(
@@ -2489,14 +2705,19 @@ mod tests {
 
         // Query for the surviving old vector at sym_idx 1: top-1 must
         // be sym_idx 1 (sidecar position of h_seed[1]).
-        let handle = crate::search::semantic::HnswHandle::open(&hnsw_path, dim, h_new.len())
+        let reader = crate::store::reader::IndexReader::open(&index_path).unwrap();
+        let handle = crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader)
             .expect("open handle");
-        let results = handle.search(&v_seed[1], 1).expect("search v_seed[1]");
+        let results = handle
+            .search_with_aliases(&v_seed[1], 1, &reader)
+            .expect("search v_seed[1]");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 1, "surviving old vector at new sym_idx 1");
 
         // Query for the freshly-added vector: top-1 must be sym_idx 4.
-        let results = handle.search(&v_added, 1).expect("search v_added");
+        let results = handle
+            .search_with_aliases(&v_added, 1, &reader)
+            .expect("search v_added");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 4, "freshly-added vector at new sym_idx 4");
     }
