@@ -418,13 +418,12 @@ fn produce_results(
         }
         check_embedder_match(root, &embedder_id)?;
         let normalized = manifest.vectors_normalized.unwrap_or(false);
-        let mut embedder = crate::embed::query_cache::make_query_embedder(&embedder_id, normalized)
-            .context("load embedding model")?;
+        let query_vector =
+            crate::embed::query_cache::query_vector(&embedder_id, normalized, query)?;
         let hnsw_path = config::hnsw_path(root);
-        let semantic_results = semantic::search_with_embedder(
+        let semantic_results = semantic::search_with_vector(
             &reader,
-            embedder.as_mut(),
-            query,
+            query_vector,
             fetch_limit,
             &hnsw_path,
             normalized,

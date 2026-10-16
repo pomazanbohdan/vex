@@ -1,148 +1,101 @@
-//! Bounded raw-vector cache for repeated semantic queries.
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sha2::Digest;
 
-use super::{Embedder, MINILM_ID};
+use super::MINILM_ID;
 
 const MAX_FILES: usize = 256;
 const MAX_TEMP_FILES: usize = 32;
 const VECTOR_BYTES: usize = 384 * 4;
 const FORMAT_TAG: &[u8] = b"query-vectors-v2";
 
-#[derive(Clone)]
-struct QueryKey(String);
-
-impl QueryKey {
-    fn new(model_id: &str, normalized: bool, query: &str) -> Self {
-        Self::from_parts(
-            FORMAT_TAG,
-            model_id.as_bytes(),
-            super::integrity::MINILM_ONNX_SHA256.as_bytes(),
-            env!("CARGO_PKG_VERSION").as_bytes(),
-            normalized,
-            query.as_bytes(),
-        )
+fn cache_key(parts: [&[u8]; 6]) -> String {
+    let mut digest = sha2::Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_le_bytes());
+        digest.update(part);
     }
-
-    fn from_parts(
-        format: &[u8],
-        model_id: &[u8],
-        onnx_sha256: &[u8],
-        version: &[u8],
-        normalized: bool,
-        query_utf8: &[u8],
-    ) -> Self {
-        let mut digest = sha2::Sha256::new();
-        let normalized = [u8::from(normalized)];
-        for part in [
-            format,
-            model_id,
-            onnx_sha256,
-            version,
-            normalized.as_slice(),
-            query_utf8,
-        ] {
-            digest.update((part.len() as u64).to_le_bytes());
-            digest.update(part);
-        }
-        Self(format!("{:x}.bin", digest.finalize()))
-    }
-
-    fn path(&self, directory: &Path) -> PathBuf {
-        directory.join(&self.0)
-    }
+    format!("{:x}", digest.finalize())
 }
 
-struct RawQueryCache {
-    directory: PathBuf,
+fn cache_get(path: &Path) -> Option<[f32; 384]> {
+    let mut file = File::open(path).ok()?;
+    let mut bytes = [0; VECTOR_BYTES];
+    file.read_exact(&mut bytes).ok()?;
+    let mut extra = [0];
+    if file.read(&mut extra).ok()? != 0 {
+        return None;
+    }
+    let mut vector = [0.0; 384];
+    for (value, chunk) in vector.iter_mut().zip(bytes.chunks_exact(4)) {
+        *value = f32::from_le_bytes(chunk.try_into().ok()?);
+    }
+    valid(&vector).then_some(vector)
 }
 
-impl RawQueryCache {
-    fn new(directory: impl Into<PathBuf>) -> Self {
-        Self {
-            directory: directory.into(),
-        }
+fn cache_put(
+    path: &Path,
+    vector: &[f32],
+    publish: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Option<()> {
+    if vector.len() != 384 || !valid(vector) {
+        return None;
     }
-
-    fn get(&self, key: &QueryKey) -> Option<[f32; 384]> {
-        let mut bytes = Vec::with_capacity(VECTOR_BYTES + 1);
-        File::open(key.path(&self.directory))
-            .ok()?
-            .take((VECTOR_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        decode(&bytes)
-    }
-
-    fn put(&self, key: &QueryKey, vector: &[f32]) -> bool {
-        self.put_with(key, vector, |from, to| std::fs::rename(from, to))
-    }
-
-    fn put_with<F>(&self, key: &QueryKey, vector: &[f32], publish: F) -> bool
-    where
-        F: FnOnce(&Path, &Path) -> std::io::Result<()>,
-    {
-        let Some(bytes) = encode_vector(vector) else {
-            return false;
-        };
-        if fs::create_dir_all(&self.directory).is_err() {
-            return false;
-        }
-        let mut owned = None;
-        for slot in 0..MAX_TEMP_FILES {
-            let path = self.directory.join(format!(".tmp-slot-{slot:02}"));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => {
-                    owned = Some((path, file));
-                    break;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => return false,
+    let directory = path.parent()?;
+    fs::create_dir_all(directory).ok()?;
+    let mut owned = None;
+    for slot in 0..MAX_TEMP_FILES {
+        let temp = directory.join(format!(".tmp-slot-{slot:02}"));
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => {
+                owned = Some((temp, file));
+                break;
             }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
         }
-        let Some((temp, mut file)) = owned else {
-            return false;
-        };
-        if file.write_all(&bytes).is_err() {
-            drop(file);
-            let _ = fs::remove_file(&temp);
-            return false;
-        }
-        drop(file);
-        let destination = key.path(&self.directory);
-        let stored = if publish(&temp, &destination).is_ok() {
-            true
-        } else {
-            let winner = self.get(key).is_some();
-            let _ = fs::remove_file(&temp);
-            winner
-        };
-        if stored {
-            prune(&self.directory);
-        }
-        stored
     }
+    let (temp, mut file) = owned?;
+    let bytes: Vec<_> = vector
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let wrote = file.write_all(&bytes).is_ok();
+    drop(file);
+    let published = wrote && publish(&temp, path).is_ok();
+    let stored = published || (wrote && cache_get(path).is_some());
+    if !published {
+        let _ = fs::remove_file(&temp);
+    }
+    stored.then(|| prune(directory))
 }
 
-pub(crate) fn make_query_embedder(id: &str, normalized: bool) -> Result<Box<dyn Embedder>> {
-    let factory_id = id.to_owned();
-    make_query_embedder_with(
-        id,
-        normalized,
-        true,
-        RawQueryCache::new(query_cache_directory()),
-        move || super::make_embedder(&factory_id),
+pub(crate) fn query_vector(id: &str, normalized: bool, query: &str) -> Result<Vec<f32>> {
+    if id != MINILM_ID {
+        return super::make_embedder(id)
+            .context("load embedding model")?
+            .embed(query)
+            .context("embed query");
+    }
+    let directory = crate::util::config::embed_cache_dir().join("query-vectors-v2");
+    let normalized = [u8::from(normalized)];
+    let key = cache_key([
+        FORMAT_TAG,
+        id.as_bytes(),
+        super::integrity::MINILM_ONNX_SHA256.as_bytes(),
+        env!("CARGO_PKG_VERSION").as_bytes(),
+        &normalized,
+        query.as_bytes(),
+    ]);
+    cached_query(
+        Some(directory.join(format!("{key}.bin"))),
+        || super::make_embedder(id)?.embed(query),
         query_integrity_eligible,
     )
-}
-
-fn query_cache_directory() -> PathBuf {
-    crate::util::config::embed_cache_dir().join("query-vectors-v2")
+    .context("embed query")
 }
 
 fn query_integrity_eligible() -> Result<bool> {
@@ -157,113 +110,34 @@ fn query_integrity_eligible() -> Result<bool> {
     Ok(true)
 }
 
-fn make_query_embedder_with<F, E>(
-    id: &str,
-    normalized: bool,
-    cpu: bool,
-    cache: RawQueryCache,
-    mut factory: F,
-    eligible: E,
-) -> Result<Box<dyn Embedder>>
-where
-    F: FnMut() -> Result<Box<dyn Embedder>> + Send + 'static,
-    E: Fn() -> Result<bool> + Send + 'static,
-{
-    if id != MINILM_ID || !cpu {
+fn cached_query(
+    path: Option<PathBuf>,
+    factory: impl FnOnce() -> Result<Vec<f32>>,
+    eligible: impl Fn() -> Result<bool>,
+) -> Result<Vec<f32>> {
+    let Some(path) = path else {
         return factory();
-    }
-    Ok(Box::new(QueryEmbedder {
-        normalized,
-        cache,
-        factory,
-        eligible,
-        inner: None,
-    }))
-}
-
-struct QueryEmbedder<F, E> {
-    normalized: bool,
-    cache: RawQueryCache,
-    factory: F,
-    eligible: E,
-    inner: Option<Box<dyn Embedder>>,
-}
-
-impl<F, E> Embedder for QueryEmbedder<F, E>
-where
-    F: FnMut() -> Result<Box<dyn Embedder>> + Send,
-    E: Fn() -> Result<bool> + Send,
-{
-    fn id(&self) -> &'static str {
-        MINILM_ID
-    }
-    fn dim(&self) -> u32 {
-        384
-    }
-    fn char_budget(&self) -> usize {
-        super::MINILM_CHAR_BUDGET
-    }
-    fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
-        let key = QueryKey::new(MINILM_ID, self.normalized, text);
-        if (self.eligible)()? {
-            if let Some(value) = self.cache.get(&key) {
-                tracing::debug!("query vector cache: hit before factory");
-                return Ok(value.to_vec());
-            }
+    };
+    if eligible()? {
+        if let Some(vector) = cache_get(&path) {
+            tracing::debug!("query vector cache: hit before factory");
+            return Ok(vector.to_vec());
         }
-        if self.inner.is_none() {
-            self.inner = Some((self.factory)()?);
-        }
-        let vector = self
-            .inner
-            .as_mut()
-            .expect("initialized above")
-            .embed(text)?;
-        if (self.eligible)()? {
-            self.cache.put(&key, &vector);
-        }
-        Ok(vector)
     }
-    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        texts.iter().map(|text| self.embed(text)).collect()
+    let vector = factory()?;
+    if eligible()? {
+        let _ = cache_put(&path, &vector, |from, to| fs::rename(from, to));
     }
+    Ok(vector)
 }
 
 #[cfg(test)]
 #[path = "query_cache/tests.rs"]
 mod tests;
 
-fn decode(bytes: &[u8]) -> Option<[f32; 384]> {
-    if bytes.len() != VECTOR_BYTES {
-        return None;
-    }
-    let mut vector = [0.0; 384];
-    for (value, chunk) in vector.iter_mut().zip(bytes.chunks_exact(4)) {
-        *value = f32::from_le_bytes(chunk.try_into().ok()?);
-    }
-    valid(&vector).then_some(vector)
-}
-
-fn encode_vector(vector: &[f32]) -> Option<Vec<u8>> {
-    if vector.len() != 384 || !valid(vector) {
-        return None;
-    }
-    Some(
-        vector
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect(),
-    )
-}
 fn valid(vector: &[f32]) -> bool {
-    vector.iter().all(|value| value.is_finite())
-        && ((vector
-            .iter()
-            .map(|value| f64::from(*value).powi(2))
-            .sum::<f64>()
-            - 1.0)
-            .abs()
-            <= 0.001)
+    let norm: f64 = vector.iter().map(|&v| f64::from(v).powi(2)).sum();
+    norm.is_finite() && (norm - 1.0).abs() <= 0.001
 }
 
 fn prune(directory: &Path) {
@@ -274,24 +148,19 @@ fn prune(directory: &Path) {
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let path = entry.path();
-            if !path.extension().is_some_and(|ext| ext == "bin")
-                || !entry.file_type().ok()?.is_file()
+            if path.extension().is_none_or(|ext| ext != "bin") || !entry.file_type().ok()?.is_file()
             {
                 return None;
             }
-            Some((
-                entry.metadata().ok()?.modified().ok()?,
-                entry.file_name(),
-                path,
-            ))
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.file_name(), path))
         })
         .collect();
-    if files.len() <= MAX_FILES {
-        return;
-    }
-    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let excess = files.len().saturating_sub(MAX_FILES);
-    for (_, _, path) in files.into_iter().take(excess) {
-        let _ = fs::remove_file(path);
+    if files.len() > MAX_FILES {
+        files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let excess = files.len().saturating_sub(MAX_FILES);
+        for (_, _, path) in files.into_iter().take(excess) {
+            let _ = fs::remove_file(path);
+        }
     }
 }
