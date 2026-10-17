@@ -6,8 +6,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- The public Rust library API `vex::search::semantic::search_with_embedder` is
+  removed; downstream crates that import it must adapt before upgrading.
+
 ### Added
 
+- Repeated identical one-shot CLI MiniLM semantic queries reuse bounded,
+  integrity-gated raw vectors across processes; MCP keeps its model warm.
 - **`install.sh`**: `curl -fsSL https://raw.githubusercontent.com/tenatarika/vex/main/install.sh | sh`
   installs `vex` and `vex-mcp` from the latest release into `~/.local/bin`
   (macOS arm64, Linux x86_64; `VEX_VERSION`, `VEX_INSTALL_DIR`, `VEX_NO_MCP`).

@@ -9,6 +9,7 @@ pub(crate) mod extra;
 pub mod integrity;
 pub mod minilm;
 pub mod model;
+pub(crate) mod query_cache;
 pub mod tokenizer;
 
 use anyhow::{bail, Result};
