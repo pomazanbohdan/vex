@@ -6,14 +6,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed
-
-- **`grep --filter-path` on Windows** accepts forward, backward and mixed
-  path separators while preserving case-sensitive substring matching and
-  native paths in results.
-- Hierarchy edges resolve only against type symbols, preserving external and ambiguous parent handling.
-- Strict usages now match complete native symbol names case-insensitively.
-
 ### Added
 
 - **`install.sh`**: `curl -fsSL https://raw.githubusercontent.com/tenatarika/vex/main/install.sh | sh`
@@ -30,8 +22,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- `tests-for` preserves same-named call sites by file and line.
-- Scoped search limits are applied after candidate fusion and filtering.
+- **`usages --strict` matches the complete symbol name.** `Service` no longer
+  picks up references to `DerivedService` (the match is case-insensitive).
+- **Hierarchy edges resolve only to types** (struct, class, interface, trait,
+  enum, type alias). A parent name that matches only a function or method is
+  now reported as an unresolved parent instead of a wrong edge.
+- **Scoped `search` returns the full limit.** With `--filter-path`,
+  `--include`/`--exclude` or `--since`/`--changed-only`, the limit is applied
+  after scoping, so matches further down are no longer dropped.
+- **`tests-for` keeps same-named tests apart.** Two tests with the same name in
+  different files or lines are both reported.
+- **`grep --filter-path` works with either separator on Windows.** `src/api/`,
+  `src\api\` and mixed forms all match; matching stays a case-sensitive
+  substring and results keep native paths.
 
 ## [1.27.4] - 2026-10-06
 
