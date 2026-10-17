@@ -1,6 +1,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use sha2::Digest;
@@ -8,9 +10,10 @@ use sha2::Digest;
 use super::MINILM_ID;
 
 const MAX_FILES: usize = 256;
-const MAX_TEMP_FILES: usize = 32;
+const TEMP_MAX_AGE: Duration = Duration::from_secs(60);
 const VECTOR_BYTES: usize = 384 * 4;
 const FORMAT_TAG: &[u8] = b"query-vectors-v2";
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 fn cache_key(parts: [&[u8]; 6]) -> String {
     let mut digest = sha2::Sha256::new();
@@ -46,19 +49,7 @@ fn cache_put(
     }
     let directory = path.parent()?;
     fs::create_dir_all(directory).ok()?;
-    let mut owned = None;
-    for slot in 0..MAX_TEMP_FILES {
-        let temp = directory.join(format!(".tmp-slot-{slot:02}"));
-        match OpenOptions::new().write(true).create_new(true).open(&temp) {
-            Ok(file) => {
-                owned = Some((temp, file));
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => return None,
-        }
-    }
-    let (temp, mut file) = owned?;
+    let (temp, mut file) = create_temp(directory).ok()?;
     let bytes: Vec<_> = vector
         .iter()
         .flat_map(|value| value.to_le_bytes())
@@ -82,6 +73,8 @@ pub(crate) fn query_vector(id: &str, normalized: bool, query: &str) -> Result<Ve
     }
     let directory = crate::util::config::embed_cache_dir().join("query-vectors-v2");
     let normalized = [u8::from(normalized)];
+    // make_embedder is CPU-only; if this ever routes through make_embedder_with_device,
+    // the resolved device must become part of the cache key to avoid mixing vectors.
     let key = cache_key([
         FORMAT_TAG,
         id.as_bytes(),
@@ -99,7 +92,7 @@ pub(crate) fn query_vector(id: &str, normalized: bool, query: &str) -> Result<Ve
 }
 
 fn query_integrity_eligible() -> Result<bool> {
-    if std::env::var_os("VEX_EMBEDDER_SKIP_CHECK").as_deref() == Some(std::ffi::OsStr::new("1")) {
+    if super::integrity::skip_check() {
         return Ok(false);
     }
     let cache = crate::util::config::embed_cache_dir();
@@ -156,11 +149,48 @@ fn prune(directory: &Path) {
             Some((modified, entry.file_name(), path))
         })
         .collect();
+    let now = SystemTime::now();
+    for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_file())
+            || !entry.file_name().to_string_lossy().starts_with(".tmp")
+        {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        if now
+            .duration_since(modified)
+            .is_ok_and(|age| age >= TEMP_MAX_AGE)
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
     if files.len() > MAX_FILES {
         files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         let excess = files.len().saturating_sub(MAX_FILES);
         for (_, _, path) in files.into_iter().take(excess) {
             let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn create_temp(directory: &Path) -> std::io::Result<(PathBuf, File)> {
+    loop {
+        let nonce = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp = directory.join(format!(
+            ".tmp-query-{}-{timestamp}-{nonce}",
+            std::process::id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
         }
     }
 }

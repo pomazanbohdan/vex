@@ -88,7 +88,7 @@ pub fn verify_file_sha256(path: &Path, expected_hex: &str) -> Result<()> {
     Ok(())
 }
 
-fn skip_check() -> bool {
+pub(super) fn skip_check() -> bool {
     matches!(std::env::var(SKIP_ENV_VAR).ok().as_deref(), Some("1"))
 }
 

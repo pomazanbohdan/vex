@@ -446,10 +446,10 @@ fn rename_error_with_corrupt_destination_never_unlinks_foreign_file() {
 }
 
 #[test]
-fn abandoned_temp_slots_have_a_fixed_bound() {
+fn abandoned_temp_slots_do_not_disable_cache() {
     let dir = TestDir::new();
     let slot_bytes = b"abandoned slot remains byte-identical";
-    for slot in 0..MAX_TEMP_FILES {
+    for slot in 0..32 {
         fs::write(dir.path().join(format!(".tmp-slot-{slot:02}")), slot_bytes).unwrap();
     }
     let path = key_path(dir.path(), MINILM_ID, false, "uncached query");
@@ -457,22 +457,36 @@ fn abandoned_temp_slots_have_a_fixed_bound() {
         cached_query(Some(path.clone()), || Ok(unit_vector()), || Ok(true)).unwrap(),
         unit_vector()
     );
-    assert!(!dir.path().join(".tmp-slot-32").exists());
-    for slot in 0..MAX_TEMP_FILES {
+    assert!(path.exists());
+    for slot in 0..32 {
         assert_eq!(
             fs::read(dir.path().join(format!(".tmp-slot-{slot:02}"))).unwrap(),
             slot_bytes
         );
     }
-    assert!(!path.exists());
-    assert_eq!(
-        fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "bin"))
-            .count(),
-        0
-    );
+    assert_eq!(cache_get(&path), Some(unit_vector().try_into().unwrap()));
+}
+
+#[test]
+fn pruning_removes_only_aged_temporary_files() {
+    let dir = TestDir::new();
+    let aged = dir.path().join(".tmp-abandoned");
+    let recent = dir.path().join(".tmp-active");
+    fs::write(&aged, b"abandoned").unwrap();
+    fs::write(&recent, b"active writer").unwrap();
+    let two_minutes_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+    fs::File::options()
+        .write(true)
+        .open(&aged)
+        .unwrap()
+        .set_modified(two_minutes_ago)
+        .unwrap();
+
+    let path = key_path(dir.path(), MINILM_ID, false, "prune temps");
+    assert!(cache_put(&path, &unit_vector(), |from, to| fs::rename(from, to)).is_some());
+
+    assert!(!aged.exists());
+    assert_eq!(fs::read(recent).unwrap(), b"active writer");
 }
 
 #[test]

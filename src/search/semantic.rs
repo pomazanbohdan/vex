@@ -1,34 +1,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use crate::embed::Embedder;
 use crate::index::symbols::SymbolKind;
 use crate::search::{hash_index, MatchType, SearchResult};
 use crate::store::reader::IndexReader;
-
-/// Semantic search using HNSW index (fast) with brute-force fallback.
-///
-/// `normalized` reflects the manifest's `vectors_normalized` flag —
-/// when `true`, the stored vectors are unit-length and the brute-force
-/// fallback uses dot product instead of full cosine. The query vector
-/// is normalized here so it matches.
-#[allow(
-    dead_code,
-    reason = "public library API; CLI already has its query vector"
-)]
-pub fn search_with_embedder(
-    reader: &IndexReader,
-    embedder: &mut dyn Embedder,
-    query: &str,
-    top_k: usize,
-    hnsw_path: &Path,
-    normalized: bool,
-) -> Result<Vec<SearchResult>> {
-    let query_vec = embedder.embed(query).context("embed query")?;
-    search_with_vector(reader, query_vec, top_k, hnsw_path, normalized)
-}
 
 pub(crate) fn search_with_vector(
     reader: &IndexReader,
