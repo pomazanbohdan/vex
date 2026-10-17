@@ -48,6 +48,39 @@ fn strict_returns_binder_resolved_call_site() {
 }
 
 #[test]
+fn strict_complete_native_name_wins() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join(".vex.toml"), "local_cache = true\n").unwrap();
+    std::fs::write(
+        tmp.path().join("native.rs"),
+        "struct Service;\nstruct DerivedService;\nfn caller() {\n  let _ = Service;\n  let _ = DerivedService;\n}\n",
+    )
+    .unwrap();
+    vex_in(tmp.path()).arg("index").assert().success();
+
+    for (name, line) in [
+        ("Service", 4),
+        ("service", 4),
+        ("SERVICE", 4),
+        ("DerivedService", 5),
+    ] {
+        let output = vex_in(tmp.path())
+            .args(["usages", name, "--strict", "--format", "json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            json["results"],
+            serde_json::json!([{"path":"native.rs","line":line}]),
+            "wrong complete-name target for {name}"
+        );
+    }
+}
+
+#[test]
 fn strict_does_not_emit_deferral_warning_anymore() {
     let tmp = TempDir::new().unwrap();
     write_project(tmp.path());
@@ -325,7 +358,7 @@ fn strict_resolves_python_class_method_cross_file() {
 }
 
 #[test]
-fn strict_bails_on_multi_candidate_unresolved_to_avoid_false_positive() {
+fn strict_ambiguous_short_name_is_not_guessed() {
     // Pin the safety side of the single-candidate fallback: when
     // multiple definitions exist for the same name, Pass-2 must NOT
     // pick one — that would silently mis-attribute the ref. The
