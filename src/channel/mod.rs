@@ -491,7 +491,14 @@ impl Channel for StrictRefsChannel {
         let mut hits = Vec::new();
         let mut pre_filter_count = 0usize;
         let mut dropped = DropCounts::default();
+        let query_name = ctx.symbol.to_lowercase();
         for sym_idx in sym_fst.find(ctx.symbol) {
+            let Some(symbol) = ctx.reader.symbol(sym_idx as usize) else {
+                continue;
+            };
+            if ctx.reader.read_string(symbol.name_offset).to_lowercase() != query_name {
+                continue;
+            }
             for edge in ctx.reader.find_ref_edges_by_symbol(sym_idx) {
                 pre_filter_count += 1;
                 let path = ctx
