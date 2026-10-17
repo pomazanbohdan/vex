@@ -144,7 +144,8 @@ jobs:
         run: |
           Invoke-Expression "& {$(Invoke-RestMethod get.scoop.sh)} -RunAsAdmin"
           $env:Path = "$env:USERPROFILE\scoop\shims;$env:Path"
-          scoop install ./vex.json
+          # A relative "./vex.json" parses as app "vex.json" in bucket "."; pass an absolute path.
+          scoop install (Resolve-Path .\vex.json).Path
           if ($LASTEXITCODE -ne 0) { throw 'scoop install failed' }
           vex --version
           if (-not (Test-Path "$env:USERPROFILE\scoop\apps\vex\current\DirectML.dll")) { throw 'DirectML.dll missing from the Scoop install' }
