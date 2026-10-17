@@ -8,6 +8,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`grep --filter-path` on Windows** accepts forward, backward and mixed
+  path separators while preserving case-sensitive substring matching and
+  native paths in results.
 - Hierarchy edges resolve only against type symbols, preserving external and ambiguous parent handling.
 - Strict usages now match complete native symbol names case-insensitively.
 
