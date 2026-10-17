@@ -1,40 +1,44 @@
 use std::collections::HashMap;
 
-use vex::embed::cache::{context_hash, EmbedCache};
-use vex::embed::{build_context, Embedder, MINILM_CHAR_BUDGET, MINILM_DIM, MINILM_ID};
-use vex::index::pipeline::{self, IndexOptions};
-use vex::parse::{language::Language, parse_file};
-use vex::search::{hash_index, semantic::search_with_embedder};
-use vex::store::reader::IndexReader;
-
-struct FixedEmbedder(Vec<f32>);
-
-impl Embedder for FixedEmbedder {
-    fn id(&self) -> &'static str {
-        MINILM_ID
-    }
-    fn dim(&self) -> u32 {
-        MINILM_DIM
-    }
-    fn char_budget(&self) -> usize {
-        MINILM_CHAR_BUDGET
-    }
-    fn embed(&mut self, _: &str) -> anyhow::Result<Vec<f32>> {
-        Ok(self.0.clone())
-    }
-    fn embed_batch(&mut self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|_| self.0.clone()).collect())
-    }
-}
+use super::search_with_vector;
+use crate::embed::cache::{context_hash, EmbedCache};
+use crate::embed::{build_context, MINILM_CHAR_BUDGET, MINILM_DIM, MINILM_ID};
+use crate::index::pipeline::{self, IndexOptions};
+use crate::parse::{language::Language, parse_file};
+use crate::search::hash_index;
+use crate::store::reader::IndexReader;
 
 #[test]
 fn real_pipeline_preserves_cached_hash_vector_and_symbol_order() {
+    if std::env::var_os("VEX_HNSW_PIPELINE_ORDER_CHILD").is_none() {
+        let test_name = std::thread::current().name().unwrap().to_owned();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("VEX_HNSW_PIPELINE_ORDER_CHILD", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "isolated child failed: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("running 1 test"),
+            "child did not run exactly one test: {stdout}"
+        );
+        assert!(
+            stdout.contains("1 passed; 0 failed"),
+            "child did not pass the target test: {stdout}"
+        );
+        return;
+    }
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path();
     let cache_dir = root.join(".vex_cache");
     std::fs::create_dir(&cache_dir).unwrap();
-    // This integration binary has one test, so the process-wide override is isolated.
-    vex::util::config::set_cache_override(cache_dir.clone(), true);
+    // Keep the process-wide override in an isolated one-test child process.
+    crate::util::config::set_cache_override(cache_dir.clone(), true);
     std::fs::write(root.join(".vex.toml"), "local_cache = true\n").unwrap();
 
     let sources = [
@@ -74,7 +78,7 @@ fn real_pipeline_preserves_cached_hash_vector_and_symbol_order() {
     }
     assert_eq!(cache.len(), 3, "two files must share one embedding context");
     cache
-        .save(&vex::util::config::embed_cache_path(root, MINILM_ID))
+        .save(&crate::util::config::embed_cache_path(root, MINILM_ID))
         .unwrap();
 
     let options = IndexOptions {
@@ -117,13 +121,13 @@ fn real_pipeline_preserves_cached_hash_vector_and_symbol_order() {
     }
     assert!(expected.is_empty());
     assert_eq!(aliases.len(), 2);
-    let mut query = vec![0.0; MINILM_DIM as usize];
-    query[0] = 1.0;
-    let mut embedder = FixedEmbedder(query);
-    let results = search_with_embedder(
+    let results = search_with_vector(
         &reader,
-        &mut embedder,
-        "fixed",
+        {
+            let mut query = vec![0.0; MINILM_DIM as usize];
+            query[0] = 1.0;
+            query
+        },
         1,
         &cache_dir.join("index.hnsw"),
         true,

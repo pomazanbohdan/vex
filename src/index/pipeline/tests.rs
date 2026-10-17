@@ -34,6 +34,207 @@ fn manifest_with_embedder(id: Option<&str>) -> Manifest {
 }
 
 #[test]
+fn invalid_update_vectors_are_dropped_after_canonical_fallback() {
+    use crate::index::symbols::{ParsedFile, ParsedRef, ParsedSymbol, SymbolKind};
+    use crate::index::types::ClusterCarryArtefacts;
+
+    let make_file = |path: &str, name: &str, line: usize| ParsedFile {
+        path: path.to_string(),
+        symbols: vec![ParsedSymbol {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            line,
+            signature: None,
+            doc: None,
+            body_tokens: None,
+        }],
+        refs: vec![ParsedRef {
+            name: format!("ref_{name}"),
+            line,
+            context: None,
+        }],
+        call_edges: Vec::new(),
+        bound_refs: Vec::new(),
+        skeletons: Vec::new(),
+        cpp_includes: Vec::new(),
+        trigram_bloom: None,
+        hierarchy_captures: Vec::new(),
+    };
+    let mut parsed = vec![make_file("z.rs", "Zed", 9), make_file("a.rs", "Aye", 2)];
+    let mut vectors = vec![vec![1.0, 2.0]];
+    let mut carry = Some(ClusterCarryArtefacts {
+        per_symbol_carried: vec![Some(10), Some(20)],
+        per_symbol_old_idx: vec![Some(0), Some(1)],
+        ..ClusterCarryArtefacts::default()
+    });
+
+    let mapping_valid = canonicalize_update_sidecars(&mut parsed, &mut vectors, &[9], &mut carry);
+
+    assert!(!mapping_valid);
+    assert!(vectors.is_empty());
+    assert_eq!(
+        parsed
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        ["a.rs", "z.rs"]
+    );
+    assert_eq!(
+        parsed
+            .iter()
+            .map(|file| file.refs[0].name.as_str())
+            .collect::<Vec<_>>(),
+        ["ref_Aye", "ref_Zed"]
+    );
+    let carry = carry.expect("aligned cluster carry remains available");
+    assert_eq!(carry.per_symbol_carried, [Some(20), Some(10)]);
+    assert_eq!(carry.per_symbol_old_idx, [Some(1), Some(0)]);
+
+    let mut parsed = vec![make_file("z.rs", "Zed", 9), make_file("a.rs", "Aye", 2)];
+    let mut vectors = Vec::new();
+    let mut misaligned_carry = Some(ClusterCarryArtefacts {
+        per_symbol_carried: vec![Some(10)],
+        per_symbol_old_idx: vec![Some(0)],
+        ..ClusterCarryArtefacts::default()
+    });
+    assert!(canonicalize_update_sidecars(
+        &mut parsed,
+        &mut vectors,
+        &[],
+        &mut misaligned_carry
+    ));
+    assert!(misaligned_carry.is_none());
+}
+
+#[test]
+fn update_invalid_vector_map_preserves_refs_cleans_sidecars_and_stays_noop() {
+    use crate::index::symbols::{ParsedFile, ParsedRef, ParsedSymbol, SymbolKind};
+    use crate::parse::scope::{BindTarget, BoundRef, RefKind, UsePath};
+    use crate::store::format::SymbolRecord;
+    use crate::store::reader::IndexReader;
+    use crate::store::writer::write_index_full;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/a.rs"),
+        "pub struct Alpha;\npub struct Beta;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/b.rs"),
+        "use crate::a::Alpha;\npub fn use_alpha(_: Alpha) {}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/trigger.rs"), "// before\n").unwrap();
+    let opts = IndexOptions {
+        with_embeddings: false,
+        ..IndexOptions::default()
+    };
+    super::run(&root, opts, "minilm-l6-v2", &[]).expect("initial project index");
+
+    let make_symbol = |name: &str, kind| ParsedSymbol {
+        name: name.to_string(),
+        kind,
+        line: 1,
+        signature: None,
+        doc: None,
+        body_tokens: None,
+    };
+    let parsed = vec![
+        ParsedFile {
+            path: "src/a.rs".to_string(),
+            symbols: vec![
+                make_symbol("Alpha", SymbolKind::Struct),
+                make_symbol("Beta", SymbolKind::Struct),
+            ],
+            refs: Vec::new(),
+            call_edges: Vec::new(),
+            bound_refs: Vec::new(),
+            skeletons: Vec::new(),
+            cpp_includes: Vec::new(),
+            trigram_bloom: None,
+            hierarchy_captures: Vec::new(),
+        },
+        ParsedFile {
+            path: "src/b.rs".to_string(),
+            symbols: vec![make_symbol("use_alpha", SymbolKind::Function)],
+            refs: vec![ParsedRef {
+                name: "Alpha".to_string(),
+                line: 2,
+                context: None,
+            }],
+            call_edges: Vec::new(),
+            bound_refs: vec![BoundRef {
+                name: "Alpha".to_string(),
+                line: 2,
+                col: 21,
+                target: BindTarget::Imported(UsePath {
+                    segments: vec!["Alpha".to_string()],
+                }),
+                kind: RefKind::Type,
+            }],
+            skeletons: Vec::new(),
+            cpp_includes: Vec::new(),
+            trigram_bloom: None,
+            hierarchy_captures: Vec::new(),
+        },
+    ];
+    let vectors = vec![vec![0.25; 384], vec![0.5; 384], vec![0.75; 384]];
+    let index_path = config::index_path(&root);
+    write_index_full(&parsed, &vectors, 384, &index_path).expect("write vector fixture");
+
+    let reader = IndexReader::open(&index_path).expect("open vector fixture");
+    assert!(
+        reader.ref_edge_count() > 0,
+        "fixture must contain a carried ref"
+    );
+    let symbols_offset = reader.header().symbols_offset as usize;
+    drop(reader);
+    let vector_index_offset =
+        symbols_offset + SymbolRecord::SIZE + SymbolRecord::SIZE - std::mem::size_of::<u32>();
+    let mut bytes = std::fs::read(&index_path).expect("read vector fixture");
+    bytes[vector_index_offset..vector_index_offset + std::mem::size_of::<u32>()]
+        .copy_from_slice(&4u32.to_le_bytes());
+    std::fs::write(&index_path, bytes).expect("corrupt middle vector index");
+
+    let hnsw_path = config::hnsw_path(&root);
+    let hash_path = config::hash_index_path(&root);
+    std::fs::write(&hnsw_path, b"stale hnsw").expect("write stale HNSW marker");
+    std::fs::write(&hash_path, b"stale hashes").expect("write stale hash marker");
+    std::fs::write(root.join("src/trigger.rs"), "// after\n").unwrap();
+
+    super::update(&root, opts, "minilm-l6-v2", &[])
+        .expect("corrupt vector mapping degrades without failing update");
+
+    let reader = IndexReader::open(&index_path).expect("open updated index");
+    assert!(!reader.has_vectors());
+    assert_eq!(reader.symbol_count(), 3);
+    assert!(
+        reader.ref_edge_count() > 0,
+        "unchanged ref edge must survive"
+    );
+    assert!(!hnsw_path.exists());
+    assert!(!hash_path.exists());
+    assert_eq!(
+        Manifest::load(&config::manifest_path(&root))
+            .unwrap()
+            .embedder_id,
+        None
+    );
+    drop(reader);
+
+    let stable_bytes = std::fs::read(&index_path).expect("read updated index");
+    super::update(&root, opts, "minilm-l6-v2", &[]).expect("no-op update");
+    assert_eq!(
+        std::fs::read(&index_path).expect("read no-op index"),
+        stable_bytes,
+        "no-op update must preserve exact index bytes"
+    );
+}
+
+#[test]
 fn options_cover_when_caller_does_not_want_embeddings() {
     let opts = IndexOptions {
         with_embeddings: false,
