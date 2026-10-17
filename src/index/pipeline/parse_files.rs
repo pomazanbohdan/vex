@@ -70,7 +70,7 @@ pub(super) struct ReconstructionResult {
 }
 
 /// Reconstruct ParsedFile + vectors for unchanged files from the existing index.
-/// Symbols are in index order (file-contiguous), vectors align 1:1 with symbols.
+/// Symbols are in index order (file-contiguous); stored vectors align to a valid leading symbol prefix.
 ///
 /// `body_tokens_sidecar` carries per-sym_idx body_tokens loaded from
 /// `index.bodytokens` (v1.15.0 B1.2):
@@ -431,11 +431,15 @@ pub(super) fn reconstruct_unchanged(
     // Carry the ordinary name-to-(file,line) FST refs independently from
     // resolved ref_edges: unresolved and ref-only files have no symbol row
     // from which to reconstruct these occurrences.
-    let mut refs_by_path: BTreeMap<String, Vec<ParsedRef>> = BTreeMap::new();
+    let mut file_indices: HashMap<String, usize> = parsed_files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| (file.path.clone(), index))
+        .collect();
     if let Some(ref_reader) = reader.ref_reader() {
-        for (name, entries) in ref_reader.find_by_prefix("") {
+        ref_reader.for_each_by_prefix("", |name, entries| {
             if name.is_empty() {
-                continue;
+                return;
             }
             for entry in entries {
                 let Some(path) = old_file_paths.get(entry.file_id as usize) else {
@@ -448,64 +452,28 @@ pub(super) fn reconstruct_unchanged(
                 if changed.contains(path.as_str()) || deleted.contains(path.as_str()) {
                     continue;
                 }
-                refs_by_path
-                    .entry(path.clone())
-                    .or_default()
-                    .push(ParsedRef {
-                        name: name.clone(),
-                        line: entry.line as usize,
-                        context: None,
+                let file_index = *file_indices.entry(path.clone()).or_insert_with(|| {
+                    parsed_files.push(ParsedFile {
+                        path: path.clone(),
+                        symbols: Vec::new(),
+                        refs: Vec::new(),
+                        call_edges: Vec::new(),
+                        bound_refs: Vec::new(),
+                        skeletons: Vec::new(),
+                        cpp_includes: Vec::new(),
+                        trigram_bloom: None,
+                        hierarchy_captures: Vec::new(),
                     });
+                    parsed_files.len() - 1
+                });
+                parsed_files[file_index].refs.push(ParsedRef {
+                    name: name.to_owned(),
+                    line: entry.line as usize,
+                    context: None,
+                });
             }
-        }
-    }
-    // Assign refs to symbol-bearing files in their existing index order.
-    // `vectors`, `cluster_carried`, and `cluster_old_sym_idx` were built in
-    // that same order and are consumed positionally by the writer.
-    for file in &mut parsed_files {
-        if let Some(refs) = refs_by_path.remove(&file.path) {
-            file.refs = refs;
-        }
-    }
-
-    // Remaining paths are FST-only files. Their BTreeMap order provides a
-    // deterministic insertion order without moving symbol-bearing files.
-    let mut remaining_refs = refs_by_path.into_iter().peekable();
-    let mut ordered_files = Vec::with_capacity(parsed_files.len() + remaining_refs.len());
-    for file in parsed_files {
-        while remaining_refs
-            .peek()
-            .is_some_and(|(path, _)| path.as_str() < file.path.as_str())
-        {
-            let (path, refs) = remaining_refs.next().expect("peeked ref path");
-            ordered_files.push(ParsedFile {
-                path,
-                symbols: Vec::new(),
-                refs,
-                call_edges: Vec::new(),
-                bound_refs: Vec::new(),
-                skeletons: Vec::new(),
-                cpp_includes: Vec::new(),
-                trigram_bloom: None,
-                hierarchy_captures: Vec::new(),
-            });
-        }
-        ordered_files.push(file);
-    }
-    for (path, refs) in remaining_refs {
-        ordered_files.push(ParsedFile {
-            path,
-            symbols: Vec::new(),
-            refs,
-            call_edges: Vec::new(),
-            bound_refs: Vec::new(),
-            skeletons: Vec::new(),
-            cpp_includes: Vec::new(),
-            trigram_bloom: None,
-            hierarchy_captures: Vec::new(),
         });
     }
-    let mut parsed_files = ordered_files;
     // P2a (`docs/HIERARCHY-EDGES.md` §8, architect CRITICAL-1 — mandatory):
     // carry forward hierarchy captures for unchanged files.
     //
@@ -624,6 +592,14 @@ pub(super) fn reconstruct_unchanged(
         }
     }
 
+    let vector_source_symbols: Vec<_> = (0..vectors.len()).collect();
+    let permutation = canonicalize_parsed_files_with_vectors(
+        &mut parsed_files,
+        &mut vectors,
+        &vector_source_symbols,
+    );
+    apply_symbol_permutation(&mut cluster_carried, &permutation);
+    apply_symbol_permutation(&mut cluster_old_sym_idx, &permutation);
     ReconstructionResult {
         parsed_files,
         vectors,
@@ -634,6 +610,120 @@ pub(super) fn reconstruct_unchanged(
         cluster_old_sym_idx,
         cluster_old_symbols_by_changed_path,
     }
+}
+
+pub(super) fn canonicalize_parsed_files(parsed: &mut [ParsedFile]) -> Vec<usize> {
+    canonicalize_parsed_files_by_vector_sources(parsed, &[]).0
+}
+
+/// Reorders vectors by the source symbol they belong to, then returns the full symbol permutation.
+///
+/// `vector_source_symbols[index]` names the input symbol for `vectors[index]`. Sources are ordered,
+/// and each file's covered symbols must form a prefix; at most one file may be partial.
+pub(super) fn canonicalize_parsed_files_with_vectors(
+    parsed: &mut [ParsedFile],
+    vectors: &mut Vec<Vec<f32>>,
+    vector_source_symbols: &[usize],
+) -> Vec<usize> {
+    assert_eq!(
+        vectors.len(),
+        vector_source_symbols.len(),
+        "vector source alignment"
+    );
+    let (symbol_permutation, vector_permutation) =
+        canonicalize_parsed_files_by_vector_sources(parsed, vector_source_symbols);
+    apply_symbol_permutation(vectors, &vector_permutation);
+    symbol_permutation
+}
+
+fn canonicalize_parsed_files_by_vector_sources(
+    parsed: &mut [ParsedFile],
+    vector_source_symbols: &[usize],
+) -> (Vec<usize>, Vec<usize>) {
+    let mut symbol_offsets = HashMap::with_capacity(parsed.len());
+    let mut coverage_groups = HashMap::with_capacity(parsed.len());
+    let mut next_symbol = 0;
+    let mut partial_file_count = 0;
+    let symbol_count = parsed.iter().map(|file| file.symbols.len()).sum::<usize>();
+    assert!(
+        vector_source_symbols.len() <= symbol_count,
+        "vector sources exceed symbol count"
+    );
+    assert!(
+        vector_source_symbols
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "vector sources must be strictly ordered"
+    );
+    if let Some(&last_source) = vector_source_symbols.last() {
+        assert!(
+            last_source < symbol_count,
+            "vector source exceeds symbol count"
+        );
+    }
+    let has_partial_coverage =
+        !vector_source_symbols.is_empty() && vector_source_symbols.len() < symbol_count;
+    for file in parsed.iter() {
+        let file_start = next_symbol;
+        let file_symbol_count = file.symbols.len();
+        let file_end = file_start + file_symbol_count;
+        let first_covered = vector_source_symbols.partition_point(|&index| index < file_start);
+        let after_covered = vector_source_symbols.partition_point(|&index| index < file_end);
+        let covered_count = after_covered - first_covered;
+        assert!(
+            vector_source_symbols[first_covered..after_covered]
+                .iter()
+                .copied()
+                .eq(file_start..file_start + covered_count),
+            "vector sources must cover a file prefix"
+        );
+        symbol_offsets.insert(file.path.clone(), file_start);
+        let group = if !has_partial_coverage {
+            0
+        } else if file_symbol_count == 0 || covered_count == 0 {
+            2
+        } else if covered_count == file_symbol_count {
+            0
+        } else {
+            partial_file_count += 1;
+            1
+        };
+        coverage_groups.insert(file.path.clone(), group);
+        next_symbol = file_end;
+    }
+    assert!(
+        partial_file_count <= 1,
+        "vector coverage has multiple partial files"
+    );
+    parsed.sort_by_cached_key(|file| (coverage_groups[&file.path], file.path.replace('\\', "/")));
+    let mut permutation = Vec::with_capacity(next_symbol);
+    for file in parsed.iter() {
+        let start = symbol_offsets[&file.path];
+        permutation.extend(start..start + file.symbols.len());
+    }
+    let vector_permutation = permutation
+        .iter()
+        .take(vector_source_symbols.len())
+        .map(|source_symbol| {
+            vector_source_symbols
+                .binary_search(source_symbol)
+                .expect("covered symbol must have a vector source")
+        })
+        .collect();
+    (permutation, vector_permutation)
+}
+
+pub(super) fn apply_symbol_permutation<T>(items: &mut Vec<T>, permutation: &[usize]) {
+    if items.is_empty() {
+        return;
+    }
+    assert_eq!(items.len(), permutation.len(), "symbol sidecar alignment");
+    let mut slots: Vec<Option<T>> = items.drain(..).map(Some).collect();
+    items.extend(
+        permutation
+            .iter()
+            .map(|&old_index| slots[old_index].take().expect("unique symbol permutation")),
+    );
 }
 
 /// Phase 14.7 — build the global blob-SHA parse cache and run a
@@ -1036,6 +1126,8 @@ pub(super) fn parse_files(
         );
     }
 
+    let mut parsed_files = parsed_files;
+    canonicalize_parsed_files(&mut parsed_files);
     Ok(parsed_files)
 }
 
@@ -1122,7 +1214,7 @@ mod reconstruction_file_order_tests {
     use crate::store::format::{CLUSTER_NEW, CLUSTER_UNCLUSTERED};
     use crate::store::reader::IndexReader;
     use crate::store::writer::{
-        write_index_with_call_graph_and_skeletons_and_fingerprints, ClusterInput,
+        write_index_full, write_index_with_call_graph_and_skeletons_and_fingerprints, ClusterInput,
     };
     use tempfile::TempDir;
 
@@ -1159,7 +1251,7 @@ mod reconstruction_file_order_tests {
     }
 
     #[test]
-    fn reconstruction_keeps_symbol_order_and_inserts_fst_only_files_stably() {
+    fn reconstruction_canonicalizes_paths_and_keeps_sidecars_aligned() {
         let tmp = TempDir::new().unwrap();
         let index_path = tmp.path().join("index.vex");
         let parsed = vec![
@@ -1226,7 +1318,7 @@ mod reconstruction_file_order_tests {
                 .iter()
                 .map(|file| file.path.as_str())
                 .collect::<Vec<_>>(),
-            ["b.js", "z.rs", "a.rs"]
+            ["a.rs", "b.js", "z.rs"]
         );
         assert_eq!(
             reconstructed
@@ -1234,14 +1326,14 @@ mod reconstruction_file_order_tests {
                 .iter()
                 .flat_map(|file| file.symbols.iter().map(|symbol| symbol.name.as_str()))
                 .collect::<Vec<_>>(),
-            ["Zed", "Aye"]
+            ["Aye", "Zed"]
         );
-        assert_eq!(reconstructed.vectors, [z_vector, a_vector]);
+        assert_eq!(reconstructed.vectors, [a_vector, z_vector]);
         assert_eq!(
             reconstructed.cluster_carried,
-            [CLUSTER_NEW, CLUSTER_UNCLUSTERED]
+            [CLUSTER_UNCLUSTERED, CLUSTER_NEW]
         );
-        assert_eq!(reconstructed.cluster_old_sym_idx, [0, 1]);
+        assert_eq!(reconstructed.cluster_old_sym_idx, [1, 0]);
 
         let mut carried_refs: Vec<_> = reconstructed
             .parsed_files
@@ -1262,6 +1354,72 @@ mod reconstruction_file_order_tests {
                 ("ordinary", "z.rs", 9),
             ]
         );
+    }
+
+    #[test]
+    fn reconstruction_keeps_a_stored_vector_prefix_inside_a_file() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index.vex");
+        let parsed = vec![ParsedFile {
+            path: "a.rs".to_string(),
+            symbols: vec![symbol("Alpha"), symbol("Beta")],
+            refs: Vec::new(),
+            call_edges: Vec::new(),
+            bound_refs: Vec::new(),
+            skeletons: Vec::new(),
+            cpp_includes: Vec::new(),
+            trigram_bloom: None,
+            hierarchy_captures: Vec::new(),
+        }];
+        let mut alpha_vector = vec![0.0; 384];
+        alpha_vector[0] = 1.0;
+        write_index_full(&parsed, &[alpha_vector.clone()], 384, &index_path)
+            .expect("write partial-vector fixture");
+
+        let reader = IndexReader::open(&index_path).expect("open fixture index");
+        let changed = HashSet::new();
+        let deleted = HashSet::new();
+        let reconstructed = reconstruct_unchanged(&reader, &changed, &deleted, None, None);
+        assert_eq!(
+            reconstructed.parsed_files[0]
+                .symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha", "Beta"]
+        );
+        assert_eq!(reconstructed.vectors, [alpha_vector.clone()]);
+
+        let mut update_parsed = reconstructed.parsed_files.clone();
+        update_parsed.push(ParsedFile {
+            path: "z.rs".to_string(),
+            symbols: vec![symbol("Zeta")],
+            refs: Vec::new(),
+            call_edges: Vec::new(),
+            bound_refs: Vec::new(),
+            skeletons: Vec::new(),
+            cpp_includes: Vec::new(),
+            trigram_bloom: None,
+            hierarchy_captures: Vec::new(),
+        });
+        let mut zeta_vector = vec![0.0; 384];
+        zeta_vector[1] = 1.0;
+        let mut update_vectors = reconstructed.vectors;
+        update_vectors.push(zeta_vector.clone());
+        let vector_source_symbols = [0, 2];
+        canonicalize_parsed_files_with_vectors(
+            &mut update_parsed,
+            &mut update_vectors,
+            &vector_source_symbols,
+        );
+        assert_eq!(
+            update_parsed
+                .iter()
+                .flat_map(|file| file.symbols.iter().map(|symbol| symbol.name.as_str()))
+                .collect::<Vec<_>>(),
+            ["Zeta", "Alpha", "Beta"]
+        );
+        assert_eq!(update_vectors, [zeta_vector, alpha_vector]);
     }
 }
 

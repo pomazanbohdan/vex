@@ -128,6 +128,103 @@ fn search_code_only_triggers_overfetch_so_limit_is_honoured() {
     }
 }
 
+#[test]
+fn scoped_limit_keeps_eligible_tail() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join(".vex.toml"), "local_cache = true\n").unwrap();
+    for dir in ["a_excluded", "z_included"] {
+        std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        for idx in 0..3 {
+            std::fs::write(
+                tmp.path().join(dir).join(format!("item{idx}.rs")),
+                "pub fn Invoice() {}\n",
+            )
+            .unwrap();
+        }
+    }
+    vex_in(tmp.path()).arg("index").assert().success();
+
+    let output = assert_ran(vex_in(tmp.path()).args([
+        "search",
+        "Invoice",
+        "--include",
+        "z_included/**",
+        "--limit",
+        "2",
+        "--format",
+        "json",
+    ]));
+    let json: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    let results = json["results"].as_array().unwrap();
+    assert_eq!(
+        results.len(),
+        2,
+        "scope filtering must retain the eligible tail: {json}"
+    );
+    assert!(results.iter().all(|row| row["path"]
+        .as_str()
+        .is_some_and(|path| path.starts_with("z_included/"))));
+}
+
+#[test]
+fn scoped_limit_zero_and_shortfall() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join(".vex.toml"), "local_cache = true\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("eligible")).unwrap();
+    std::fs::write(
+        tmp.path().join("eligible").join("one.rs"),
+        "pub fn Invoice() {}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join("excluded")).unwrap();
+    std::fs::write(
+        tmp.path().join("excluded").join("one.rs"),
+        "pub fn Invoice() {}\n",
+    )
+    .unwrap();
+    vex_in(tmp.path()).arg("index").assert().success();
+
+    let zero = assert_ran(vex_in(tmp.path()).args([
+        "search",
+        "Invoice",
+        "--include",
+        "eligible/**",
+        "--limit",
+        "0",
+        "--format",
+        "json",
+    ]));
+    let zero: serde_json::Value = serde_json::from_slice(&zero.get_output().stdout).unwrap();
+    assert_eq!(
+        zero["results"].as_array().unwrap().len(),
+        0,
+        "zero limit: {zero}"
+    );
+
+    let shortfall = assert_ran(vex_in(tmp.path()).args([
+        "search",
+        "Invoice",
+        "--include",
+        "eligible/**",
+        "--limit",
+        "5",
+        "--format",
+        "json",
+    ]));
+    let shortfall: serde_json::Value =
+        serde_json::from_slice(&shortfall.get_output().stdout).unwrap();
+    let results = shortfall["results"].as_array().unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "must return only eligible matches without padding: {shortfall}"
+    );
+    assert!(results[0]["path"]
+        .as_str()
+        .unwrap()
+        .starts_with("eligible/"));
+}
+
 /// Tiny inline mirror of `src/util/paths.rs::is_doc_path` so the
 /// test binary doesn't pull in the whole vex lib just to check
 /// extensions. Kept lockstep with the canonical list.

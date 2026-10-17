@@ -1,10 +1,13 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
 const MAGIC: &[u8; 4] = b"VEXR";
+// Bump when parser carry/reconstruction behavior changes the output of an
+// existing index; a missing or old marker forces one migration update.
+// Serialized `ParsedFile` shape changes instead bump `CACHE_FORMAT_VERSION`.
 pub(super) const CURRENT: u16 = 1;
 const FILE_NAME: &str = "index.parse-revision";
 
@@ -17,7 +20,20 @@ fn marker_bytes() -> [u8; 6] {
 
 /// The marker versions parser carry semantics independently from cache payloads.
 pub(super) fn is_current(index_dir: &Path) -> bool {
-    fs::read(index_dir.join(FILE_NAME)).is_ok_and(|bytes| bytes == marker_bytes())
+    let Ok(file) = File::open(index_dir.join(FILE_NAME)) else {
+        return false;
+    };
+    let expected = marker_bytes();
+    let read_limit = expected.len() + 1;
+    let mut bytes = Vec::with_capacity(read_limit);
+    if file
+        .take(read_limit as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return false;
+    }
+    bytes == expected
 }
 
 /// Durably make the index stale before the first required output mutation.
@@ -67,6 +83,32 @@ mod tests {
         assert!(!is_current(tmp.path()));
         save(tmp.path()).unwrap();
         assert!(is_current(tmp.path()));
+    }
+
+    #[test]
+    fn malformed_marker_lengths_and_bytes_are_not_current() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FILE_NAME);
+        assert!(!is_current(tmp.path()), "missing marker is stale");
+
+        let expected = marker_bytes();
+        let mut trailing = expected.to_vec();
+        trailing.push(0);
+        let cases: [&[u8]; 3] = [&expected[..5], b"BADR\x01\x00", &trailing];
+        for bytes in cases {
+            fs::write(&path, bytes).unwrap();
+            assert!(!is_current(tmp.path()), "invalid marker: {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn oversized_marker_is_rejected_after_a_bounded_read() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FILE_NAME);
+        let mut file = File::create(path).unwrap();
+        file.write_all(&marker_bytes()).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        assert!(!is_current(tmp.path()));
     }
 
     #[test]
