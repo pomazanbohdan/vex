@@ -103,6 +103,54 @@ jobs:
       - run: scripts/smoke-rhel9.sh target/release
       - run: target/release/vex --version
 
+  # The Windows installers against the latest release: install.ps1 under
+  # PowerShell 7 and, the way users run it (irm | iex), under Windows
+  # PowerShell 5.1; then Scoop from the manifest the release workflow commits
+  # to tenatarika/scoop-bucket.
+  windows-install:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.ps1 (PowerShell 7)
+        shell: pwsh
+        run: |
+          $env:VEX_INSTALL_DIR = "$env:RUNNER_TEMP\vex-pwsh"
+          ./install.ps1
+          foreach ($f in 'vex.exe', 'vex-mcp.exe', 'DirectML.dll') {
+            if (-not (Test-Path "$env:VEX_INSTALL_DIR\$f")) { throw "$f was not installed" }
+          }
+          & "$env:VEX_INSTALL_DIR\vex.exe" --version
+      - name: install.ps1 via irm | iex (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $env:VEX_INSTALL_DIR = "$env:RUNNER_TEMP\vex-ps51"
+          Get-Content -Raw ./install.ps1 | Invoke-Expression
+          & "$env:VEX_INSTALL_DIR\vex.exe" --version
+      - name: Render the Scoop manifest for the latest release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(gh release view --repo tenatarika/vex --json tagName --jq .tagName)"
+          for n in vex vex-mcp; do
+            gh release download "$tag" --repo tenatarika/vex -p "$n-x86_64-pc-windows-msvc.tar.gz" -D scoop-dl
+          done
+          sha() { sha256sum "scoop-dl/$1-x86_64-pc-windows-msvc.tar.gz" | cut -d' ' -f1; }
+          scripts/render-scoop-manifest.sh "${tag#v}" "$(sha vex)" "$(sha vex-mcp)" > vex.json
+          cat vex.json
+      - name: Install vex with Scoop
+        shell: pwsh
+        run: |
+          Invoke-Expression "& {$(Invoke-RestMethod get.scoop.sh)} -RunAsAdmin"
+          $env:Path = "$env:USERPROFILE\scoop\shims;$env:Path"
+          # A relative "./vex.json" parses as app "vex.json" in bucket "."; pass an absolute path.
+          scoop install (Resolve-Path .\vex.json).Path
+          if ($LASTEXITCODE -ne 0) { throw 'scoop install failed' }
+          vex --version
+          if (-not (Test-Path "$env:USERPROFILE\scoop\apps\vex\current\DirectML.dll")) { throw 'DirectML.dll missing from the Scoop install' }
+          Get-Command vex-mcp | Format-List Source
+
   # Beta gives early warning about regressions in upcoming stable.
   # Allowed to fail — informational only.
   beta:

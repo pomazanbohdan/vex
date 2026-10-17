@@ -32,6 +32,9 @@
 //! 256 cases × 2 builds per case ≈ 500 ms on M1 — `proptest`-default
 //! sampling. Set `PROPTEST_CASES` to widen.
 
+#[path = "common/hnsw_fixture.rs"]
+mod hnsw_fixture;
+
 use std::collections::HashSet;
 
 use proptest::prelude::*;
@@ -162,8 +165,10 @@ proptest! {
         let tmp_inc = TempDir::new().expect("tempdir");
         let inc_hnsw = tmp_inc.path().join("index.hnsw");
         let inc_hash = tmp_inc.path().join("index.hashes");
+        hnsw_fixture::write_index(tmp_inc.path(), &old_vectors);
         build_hnsw_at(&inc_hnsw, &inc_hash, &old_vectors, &old_hashes)
             .expect("seed build_hnsw_at");
+        hnsw_fixture::write_index(tmp_inc.path(), &new_vectors);
         let applied = build_hnsw_incremental_at(&inc_hnsw, &inc_hash, &new_vectors, &new_hashes)
             .expect("incremental_at");
         prop_assert!(
@@ -177,6 +182,7 @@ proptest! {
         let tmp_full = TempDir::new().expect("tempdir");
         let full_hnsw = tmp_full.path().join("index.hnsw");
         let full_hash = tmp_full.path().join("index.hashes");
+        hnsw_fixture::write_index(tmp_full.path(), &new_vectors);
         build_hnsw_at(&full_hnsw, &full_hash, &new_vectors, &new_hashes)
             .expect("full build_hnsw_at");
 

@@ -75,6 +75,9 @@ See [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) for the full coverage matrix, c
 # Install script (macOS arm64, Linux x86_64): vex + vex-mcp into ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/tenatarika/vex/main/install.sh | sh
 
+# Windows (PowerShell): vex + vex-mcp into %LOCALAPPDATA%\Programs\vex, added to PATH
+irm https://raw.githubusercontent.com/tenatarika/vex/main/install.ps1 | iex
+
 # Homebrew (macOS/Linux)
 brew tap tenatarika/tap
 brew install vex
@@ -121,7 +124,13 @@ Built on the `ubuntu-22.04` GitHub runner (glibc-linked, libstdc++ linked in). F
 
 ### Windows
 
-Pre-built `vex.exe` ships in every GitHub Release.
+Pre-built `vex.exe` ships in every GitHub Release. The quickest way to install it, from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/tenatarika/vex/main/install.ps1 | iex
+```
+
+It puts `vex.exe`, `vex-mcp.exe` and `DirectML.dll` in `%LOCALAPPDATA%\Programs\vex` (a per-user folder) and adds it to your user `PATH`. `VEX_VERSION`, `VEX_INSTALL_DIR` and `VEX_NO_MCP=1` work as in `install.sh`. To install by hand instead:
 
 1. Download `vex-x86_64-pc-windows-msvc.tar.gz` from the [latest release](https://github.com/tenatarika/vex/releases/latest)
 2. Extract `vex.exe` somewhere stable (e.g. `C:\Users\<you>\bin\`) — `tar -xzf vex-x86_64-pc-windows-msvc.tar.gz` from a recent PowerShell, or 7-Zip / WinRAR via right-click. Security note: `vex.exe` loads the bundled `DirectML.dll` from its own folder, so on a multi-user machine or shared drive prefer a directory other users can't write to (e.g. `C:\Program Files\vex\` — with the trade-off that `vex self-update` then needs an elevated shell). See [GPU_SUPPORT.md §6](docs/GPU_SUPPORT.md).

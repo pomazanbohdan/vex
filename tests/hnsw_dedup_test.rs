@@ -18,6 +18,9 @@
 //! warn-log), so end-to-end the collision becomes "second symbol invisible
 //! to semantic search" rather than "whole build aborts".
 
+#[path = "common/hnsw_fixture.rs"]
+mod hnsw_fixture;
+
 use std::collections::HashSet;
 
 use tempfile::TempDir;
@@ -89,6 +92,7 @@ fn build_hnsw_at_all_unique_hashes_writes_all_vectors() {
     let vectors: Vec<Vec<f32>> = (0..5).map(one_hot).collect();
     let hashes: Vec<u64> = (0..5).map(|i| 0xABCD_0000_u64 + i as u64).collect();
 
+    hnsw_fixture::write_index(&root, &vectors);
     build_hnsw_at(&hnsw_path, &hash_path, &vectors, &hashes)
         .expect("build_hnsw_at with unique hashes must succeed");
 
@@ -143,6 +147,7 @@ fn build_hnsw_at_with_duplicate_hashes_returns_ok_and_deduplicates() {
     let hashes = vec![collision_hash, collision_hash];
 
     // Before the fix this call aborts with the usearch duplicate-key error.
+    hnsw_fixture::write_index(&root, &vectors);
     let result = build_hnsw_at(&hnsw_path, &hash_path, &vectors, &hashes);
     assert!(
         result.is_ok(),
@@ -196,6 +201,7 @@ fn build_hnsw_at_all_identical_hashes_keeps_one_vector() {
     let vectors: Vec<Vec<f32>> = (0..10).map(one_hot).collect();
     let hashes: Vec<u64> = vec![single_hash; 10];
 
+    hnsw_fixture::write_index(&root, &vectors);
     let result = build_hnsw_at(&hnsw_path, &hash_path, &vectors, &hashes);
     assert!(
         result.is_ok(),
@@ -243,6 +249,7 @@ fn build_hnsw_at_partial_duplicates_deduplicates_only_collisions() {
     let hashes = vec![hash_a, hash_b, hash_a, hash_c, hash_b];
     let vectors: Vec<Vec<f32>> = (0..5).map(one_hot).collect();
 
+    hnsw_fixture::write_index(&root, &vectors);
     let result = build_hnsw_at(&hnsw_path, &hash_path, &vectors, &hashes);
     assert!(
         result.is_ok(),
@@ -299,6 +306,7 @@ fn build_hnsw_incremental_at_with_new_duplicate_hashes_returns_ok_true() {
     // Seed: 2 distinct vectors.
     let seed_hashes = vec![0x5EED_0001_u64, 0x5EED_0002_u64];
     let seed_vectors: Vec<Vec<f32>> = vec![one_hot(0), one_hot(1)];
+    hnsw_fixture::write_index(&root, &seed_vectors);
     build_hnsw_at(&hnsw_path, &hash_path, &seed_vectors, &seed_hashes).expect("seed build_hnsw_at");
 
     // New corpus: keep both seeds, then add 3 new symbols where two share
@@ -316,6 +324,7 @@ fn build_hnsw_incremental_at_with_new_duplicate_hashes_returns_ok_true() {
     let new_vectors: Vec<Vec<f32>> = (0..5).map(|i| one_hot(i + 2)).collect();
 
     // tombstone: 0 removes out of 2 seeds = 0% < 25% → incremental applies.
+    hnsw_fixture::write_index(&root, &new_vectors);
     let result = build_hnsw_incremental_at(&hnsw_path, &hash_path, &new_vectors, &new_hashes);
     assert!(
         result.is_ok(),
@@ -365,6 +374,7 @@ fn build_hnsw_incremental_at_new_vector_colliding_with_existing_is_skipped() {
 
     let seed_hash: u64 = 0x00EA_57ED_DEAD_BEEF_u64;
     let seed_vector = one_hot(0);
+    hnsw_fixture::write_index(&root, std::slice::from_ref(&seed_vector));
     build_hnsw_at(
         &hnsw_path,
         &hash_path,
@@ -379,6 +389,7 @@ fn build_hnsw_incremental_at_new_vector_colliding_with_existing_is_skipped() {
     let new_hashes = vec![seed_hash, new_hash];
     let new_vectors = vec![one_hot(0), one_hot(5)];
 
+    hnsw_fixture::write_index(&root, &new_vectors);
     let result = build_hnsw_incremental_at(&hnsw_path, &hash_path, &new_vectors, &new_hashes);
     assert!(
         result.is_ok(),

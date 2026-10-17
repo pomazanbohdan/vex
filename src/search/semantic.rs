@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -86,10 +86,18 @@ fn hnsw_view_preflight(path: &Path, query_dim: usize) -> Result<()> {
     use usearch::Index;
 
     let path_str = path.to_str().context("HNSW path is not valid UTF-8")?;
-    Index::metadata(path_str).context("invalid HNSW metadata")?;
+    let metadata = Index::metadata(path_str).context("invalid HNSW metadata")?;
+    anyhow::ensure!(
+        metadata.dimensions == query_dim as u64
+            && matches!(metadata.metric, usearch::MetricKind::Cos)
+            && matches!(metadata.quantization, usearch::ScalarKind::F32)
+            && !metadata.multi,
+        "unsupported HNSW vector format"
+    );
 
-    let mut file = File::open(path).context("open HNSW file")?;
+    let file = File::open(path).context("open HNSW file")?;
     let file_len = file.metadata()?.len();
+    let mut file = BufReader::new(file);
     let mut prefix = [0; 8];
     file.read_exact(&mut prefix).context("short HNSW prefix")?;
     let rows = u32::from_le_bytes(prefix[..4].try_into().unwrap()) as u64;
@@ -121,10 +129,22 @@ fn hnsw_view_preflight(path: &Path, query_dim: usize) -> Result<()> {
     anyhow::ensure!(&dense_header[..7] == b"usearch", "invalid HNSW magic");
 
     file.seek(SeekFrom::Start(sparse_offset))?;
-    let mut node_count_bytes = [0; 8];
-    file.read_exact(&mut node_count_bytes)
+    let mut sparse_header = [0; 40];
+    file.read_exact(&mut sparse_header)
         .context("short HNSW sparse header")?;
-    let node_count = u64::from_le_bytes(node_count_bytes);
+    let field = |offset| u64::from_le_bytes(sparse_header[offset..offset + 8].try_into().unwrap());
+    let node_count = field(0);
+    let connectivity = field(8);
+    let connectivity_base = field(16);
+    anyhow::ensure!(
+        rows == node_count
+            && metadata.count_present.checked_add(metadata.count_deleted) == Some(rows),
+        "HNSW matrix/node count mismatch"
+    );
+    anyhow::ensure!(
+        connectivity >= 2 && connectivity_base >= connectivity,
+        "invalid HNSW connectivity"
+    );
     let levels_end = levels_offset
         .checked_add(
             node_count
@@ -133,6 +153,33 @@ fn hnsw_view_preflight(path: &Path, query_dim: usize) -> Result<()> {
         )
         .context("HNSW levels end overflow")?;
     anyhow::ensure!(levels_end <= file_len, "truncated HNSW levels table");
+
+    // usearch 2.25.3 index.hpp: a node stores key:u64, level:i16,
+    // a base adjacency block, then `level` upper adjacency blocks.
+    // Each block has count:u32 and fixed-capacity u32 neighbor slots.
+    let block_size = |capacity: u64| {
+        capacity
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(4))
+            .context("HNSW adjacency size overflow")
+    };
+    let base_size = block_size(connectivity_base)?
+        .checked_add(10)
+        .context("HNSW node size overflow")?;
+    let upper_size = block_size(connectivity)?;
+    let mut expected_end = levels_end;
+    for _ in 0..node_count {
+        let mut level = [0; 2];
+        file.read_exact(&mut level).context("short HNSW level")?;
+        let level = u64::try_from(i16::from_le_bytes(level)).context("negative HNSW level")?;
+        expected_end = level
+            .checked_mul(upper_size)
+            .and_then(|n| n.checked_add(base_size))
+            .and_then(|n| n.checked_add(expected_end))
+            .context("HNSW node extent overflow")?;
+        anyhow::ensure!(expected_end <= file_len, "truncated HNSW node payload");
+    }
+    anyhow::ensure!(expected_end == file_len, "HNSW serialized length mismatch");
     Ok(())
 }
 
@@ -147,7 +194,6 @@ impl HnswHandle {
     /// - the paired `index.hashes` sidecar is missing or malformed
     ///   (pre-1.14.1 indexes have no sidecar — re-run `vex index
     ///   --semantic` to upgrade)
-    /// - the sidecar is legacy/unbound or its symbol-mapping digest is stale
     pub(crate) fn open(hnsw_path: &Path, query_dim: usize, reader: &IndexReader) -> Option<Self> {
         use usearch::{new_index, IndexOptions, MetricKind, ScalarKind};
 
@@ -190,12 +236,12 @@ impl HnswHandle {
         // malformed the HNSW is unusable (we'd return correct top-k by
         // hash but couldn't map back to records[]) — bail to brute force.
         let hash_index_path = hnsw_path.parent()?.join("index.hashes");
-        let hashes = hash_index::load_bound(&hash_index_path, reader)
+        let hashes = hash_index::load_for_hnsw(&hash_index_path, reader)
             .map_err(|e| {
                 tracing::warn!(
                     path = %hash_index_path.display(),
                     error = %e,
-                    "HNSW hash-index mapping is missing, unbound, or stale — re-run `vex index --semantic`; falling back to brute-force"
+                    "HNSW hash-index mapping is missing or stale — re-run `vex index --semantic`; falling back to brute-force"
                 )
             })
             .ok()?;
@@ -469,7 +515,6 @@ mod tests {
     fn hnsw_view_preflight_rejects_malformed_bounds() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("index.hnsw");
-        let sidecar = tmp.path().join("index.hashes");
         let mut vector = vec![0.0; 384];
         vector[0] = 1.0;
         let context = build_context(
@@ -482,7 +527,17 @@ mod tests {
             MINILM_CHAR_BUDGET,
         );
         let hash = context_hash(MINILM_ID, &context);
-        crate::index::pipeline::build_hnsw_at(&path, &sidecar, &[vector], &[hash]).unwrap();
+        let graph = usearch::new_index(&usearch::IndexOptions {
+            dimensions: 384,
+            metric: usearch::MetricKind::Cos,
+            quantization: usearch::ScalarKind::F32,
+            ..Default::default()
+        })
+        .unwrap();
+        graph.reserve(1).unwrap();
+        graph.add(hash, &vector).unwrap();
+        graph.save(path.to_str().unwrap()).unwrap();
+        drop(graph);
         let valid = std::fs::read(&path).unwrap();
         assert!(hnsw_view_preflight(&path, 384).is_ok());
 
@@ -509,12 +564,29 @@ mod tests {
             dense_offset + 20,
             sparse_offset + 12,
             levels_offset + node_count * 2 - 1,
+            levels_offset + node_count * 2,
+            levels_offset + node_count * 2 + 9,
+            valid.len() - 1,
         ] {
             std::fs::write(&path, &valid[..len]).unwrap();
             assert!(
                 hnsw_view_preflight(&path, 384).is_err(),
                 "accepted truncation at {len}"
             );
+        }
+        let mut malformed = valid.clone();
+        malformed.extend_from_slice(&[0]);
+        std::fs::write(&path, malformed).unwrap();
+        assert!(hnsw_view_preflight(&path, 384).is_err());
+        for (offset, bytes) in [
+            (sparse_offset, u64::MAX.to_le_bytes().to_vec()),
+            (sparse_offset + 8, u64::MAX.to_le_bytes().to_vec()),
+            (levels_offset, (-1_i16).to_le_bytes().to_vec()),
+        ] {
+            let mut malformed = valid.clone();
+            malformed[offset..offset + bytes.len()].copy_from_slice(&bytes);
+            std::fs::write(&path, malformed).unwrap();
+            assert!(hnsw_view_preflight(&path, 384).is_err());
         }
     }
 }

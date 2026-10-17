@@ -58,17 +58,12 @@ pub(crate) fn matches_hnsw<'a>(
             .all(|&hash| index.count(hash) == 1)
 }
 
-/// Atomic save: write to `.tmp`, then rename. Matches the convention
-/// used by `embed::cache::EmbedCache::save` and `store::writer` —
-/// half-written sidecars can't be mistaken for valid ones.
+/// Atomically write a legacy v1 sidecar for compatibility callers.
 ///
-/// **Note (v1.15.0 C):** the production hot path
-/// (`pipeline::output::commit_hnsw_and_sidecar`) no longer calls this
-/// wrapper — it uses [`save_to_tmp`] directly so the HNSW and sidecar
-/// renames can be batched two-phase. `save` is retained as the
-/// convenience entry point for any future caller that wants a single-
-/// file atomic write without the two-phase orchestration. Unit tests
-/// in this module exercise both `save` and the split form.
+/// V1 stores hashes without ordered-symbol binding. Search validates graph
+/// structure and each returned vector, but cannot detect equal-vector symbol
+/// reassociation. Production indexing uses `save_bound_to_tmp` to publish v2
+/// together with the HNSW graph; rebuilding creates that stronger binding.
 #[allow(dead_code)]
 pub fn save(path: &Path, hashes: &[u64]) -> Result<()> {
     let tmp = path.with_extension("hashes.tmp");
@@ -82,21 +77,10 @@ pub fn save(path: &Path, hashes: &[u64]) -> Result<()> {
     Ok(())
 }
 
-/// v1.15.0 C — split out the "write tmp" half of [`save`] so the
-/// orchestrator in `pipeline::output` can do a two-phase atomic
-/// commit of the HNSW + sidecar pair: write both `.tmp` files,
-/// fsync, then rename both back-to-back. The inconsistency window
-/// (one renamed, one not) shrinks from "between two file-content
-/// writes" (~ms on a large sidecar) to "between two rename syscalls"
-/// (~μs) — small enough that `HnswHandle::open`'s size-check
-/// fallback rarely fires in practice.
-///
-/// `tmp_path` is the destination of the tmp write; the caller picks
-/// the path (typically `final_path.with_extension("hashes.tmp")`).
-/// On success the tmp file exists, is fsync'd, and is ready to be
-/// renamed to the final path via plain `std::fs::rename`. On
-/// failure the tmp file may exist in a partial state; callers
-/// should treat any error as a "tmp leak" they need to clean up.
+/// Write and fsync a legacy v1 temporary sidecar for compatibility callers.
+/// The caller owns rename and cleanup on failure. Production publication
+/// requires the sibling index and uses `save_bound_to_tmp` instead.
+#[allow(dead_code)]
 pub fn save_to_tmp(tmp_path: &Path, hashes: &[u64]) -> Result<()> {
     write_sidecar(tmp_path, hashes, None)
 }
@@ -159,17 +143,18 @@ pub fn load(path: &Path) -> Result<Vec<u64>> {
     read_sidecar(path).map(|(_, hashes, _)| hashes)
 }
 
-pub(crate) fn load_bound(path: &Path, reader: &IndexReader) -> Result<Vec<u64>> {
-    let (version, hashes, digest) = read_sidecar(path)?;
+pub(crate) fn load_for_hnsw(path: &Path, reader: &IndexReader) -> Result<Vec<u64>> {
+    let (_, hashes, digest) = read_sidecar(path)?;
     anyhow::ensure!(
-        version == VERSION_V2,
-        "hash-index mapping evidence is absent; re-run `vex index --semantic`"
+        hashes.len() == reader.symbol_count(),
+        "hash-index count disagrees with index symbol count"
     );
-    let expected = mapping_digest(reader, &hashes)?;
-    anyhow::ensure!(
-        digest == Some(expected),
-        "hash-index symbol mapping mismatch; re-run `vex index --semantic`"
-    );
+    if let Some(digest) = digest {
+        anyhow::ensure!(
+            digest == mapping_digest(reader, &hashes)?,
+            "hash-index symbol mapping mismatch; re-run `vex index --semantic`"
+        );
+    }
     Ok(hashes)
 }
 
@@ -387,5 +372,77 @@ mod tests {
         // "absence ≡ no sidecar" semantics; the loader doesn't decide
         // policy for them.
         assert!(load(&p).is_err());
+    }
+
+    #[test]
+    #[ignore = "release-mode 100k-symbol mapping cost measurement"]
+    fn mapping_cost_100k_symbols() {
+        use crate::index::symbols::{ParsedFile, ParsedSymbol, SymbolKind};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const COUNT: usize = 100_001;
+        const DIM: u32 = 384;
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index.vex");
+        let sidecar_path = tmp.path().join("index.hashes");
+        let parsed = vec![ParsedFile {
+            path: "src/representative/module/fixture.rs".into(),
+            symbols: (0..COUNT)
+                .map(|i| ParsedSymbol {
+                    name: format!("symbol_{i:06}"),
+                    kind: SymbolKind::Function,
+                    line: i + 1,
+                    signature: Some(format!("pub fn symbol_{i:06}(input: &str) -> bool")),
+                    doc: None,
+                    body_tokens: None,
+                })
+                .collect(),
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        let mut vector = vec![0.0; DIM as usize];
+        vector[0] = 1.0;
+        let vectors = vec![vector; COUNT];
+        crate::store::writer::write_index_full(&parsed, &vectors, DIM, &index_path).unwrap();
+        drop(vectors);
+        drop(parsed);
+        let hashes: Vec<u64> = (0..COUNT as u64).collect();
+        let reader = IndexReader::open(&index_path).unwrap();
+        save_bound_to_tmp(&sidecar_path, &hashes, &reader).unwrap();
+        let expected = mapping_digest(&reader, &hashes).unwrap();
+        for _ in 0..3 {
+            assert_eq!(mapping_digest(&reader, &hashes).unwrap(), expected);
+            assert_eq!(load_for_hnsw(&sidecar_path, &reader).unwrap(), hashes);
+        }
+        let mut digest_ns = Vec::new();
+        let mut sidecar_load_ns = Vec::new();
+        for _ in 0..30 {
+            let start = Instant::now();
+            let digest = black_box(mapping_digest(black_box(&reader), black_box(&hashes)).unwrap());
+            digest_ns.push(start.elapsed().as_nanos());
+            assert_eq!(digest, expected);
+            let start = Instant::now();
+            let loaded =
+                black_box(load_for_hnsw(black_box(&sidecar_path), black_box(&reader)).unwrap());
+            sidecar_load_ns.push(start.elapsed().as_nanos());
+            assert_eq!(loaded, hashes);
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "symbols": COUNT, "dimensions": DIM, "warmups": 3, "samples": 30,
+                "index_bytes": std::fs::metadata(index_path).unwrap().len(),
+                "sidecar_bytes": std::fs::metadata(sidecar_path).unwrap().len(),
+                "digest_ns": digest_ns, "sidecar_load_including_digest_ns": sidecar_load_ns,
+                "mapping_digest": expected,
+                "scope": "warm reader; fixture creation excluded; no HNSW graph open or model inference"
+            })
+        );
     }
 }

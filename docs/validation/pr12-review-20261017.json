@@ -1,0 +1,625 @@
+{
+  "review": "https://github.com/tenatarika/vex/pull/12#pullrequestreview-5558324001",
+  "baseline_revision": "4caadf4de71a78ecc6eee14c6357ac54a679816b",
+  "environment": {
+    "captured_at_utc": "2026-10-17T15:39:18Z",
+    "platform": "Windows-11-10.0.26300-SP0",
+    "logical_cpu_count": 24,
+    "preflight": {
+      "captured_at_utc": "2026-10-17T15:38:56.163675+00:00",
+      "quiet": true,
+      "cpu_busy_percent_samples": [
+        5.5380742605412205,
+        5.4404145077720205,
+        5.387647831800263
+      ],
+      "cpu_busy_limit_percent": 20,
+      "logical_cpus": 24,
+      "platform": "Windows-11-10.0.26300-SP0",
+      "compiler": "rustc 1.99.1 (58cf8f9c3 2026-10-13)"
+    }
+  },
+  "candidate_source_sha256": {
+    "CHANGELOG.md": "851e56c778b5d6ca0c49bab656977b01df4fdbd7c0ea914dd64ea5b1687ed655",
+    "Cargo.toml": "11d459d065721ae1d5045edc800a71b62598679ea30011808bf852c497d4f533",
+    "benches/perf_b12.rs": "f1665f8c3b210fb90dc1a5c9d8588626d7e3d4edb1f93e056364920392105a81",
+    "src/index/pipeline/output.rs": "8177f7145d6821303543e34e3f006699a650511eda0b3213211d5fbaaf811375",
+    "src/search/hash_index.rs": "aba5eb37a9e4f6840c883ffaae9058b15b4d61fcd8aaa214e18c4ccd1435d63e",
+    "src/search/semantic.rs": "c784236fec2a79664abfcdbd0e5e57dec5991136106c541c8d9950346e7c312a",
+    "tests/hnsw_dedup_test.rs": "cece79755a2928a18a334b003e43f11d1ee547f166fa78739484cf3202ab0d76",
+    "tests/incremental_hnsw_property_test.rs": "ac25c7295538f79fac749c323c528c03eccd1fe5f83941c834757cbd6beb2272",
+    "tests/common/hnsw_fixture.rs": "a62400453ba507a4baae4798819c5bae9f2db8287814dfce04bc9db7ffcba9e7",
+    "tests/hnsw_pipeline_order_test.rs": "14e2f122d91acac8a156adcfc21d63a634b902b3f3b7d3e042812f25295adece"
+  },
+  "mapping_cost": {
+    "raw": {
+      "digest_ns": [
+        9539500,
+        8993300,
+        9276600,
+        8849000,
+        10142300,
+        10001200,
+        10956000,
+        11168100,
+        9638900,
+        9117400,
+        9060000,
+        9054900,
+        8752700,
+        9154200,
+        8597000,
+        8225300,
+        8645200,
+        8738700,
+        8313600,
+        9357200,
+        8783800,
+        9189400,
+        8504800,
+        8794300,
+        8858000,
+        8448000,
+        8144000,
+        8324200,
+        8320500,
+        8670600
+      ],
+      "dimensions": 384,
+      "index_bytes": 162402748,
+      "mapping_digest": 12150567134011121502,
+      "samples": 30,
+      "scope": "warm reader; fixture creation excluded; no HNSW graph open or model inference",
+      "sidecar_bytes": 800028,
+      "sidecar_load_including_digest_ns": [
+        9725400,
+        9360800,
+        8782700,
+        8672000,
+        11340400,
+        11779300,
+        10396300,
+        9933300,
+        10389500,
+        9613700,
+        10048000,
+        9160000,
+        8797900,
+        8730700,
+        9295000,
+        8821500,
+        9237100,
+        9558300,
+        8803100,
+        8906900,
+        9186000,
+        8633500,
+        8811200,
+        8948200,
+        8908200,
+        8841200,
+        8683500,
+        9235300,
+        8825700,
+        8722300
+      ],
+      "symbols": 100001,
+      "warmups": 3
+    },
+    "digest": {
+      "median_ms": 8.8535,
+      "p95_ms": 10.956,
+      "range_ms": [
+        8.144,
+        11.1681
+      ]
+    },
+    "sidecar_load_including_digest": {
+      "median_ms": 9.0541,
+      "p95_ms": 11.3404,
+      "range_ms": [
+        8.6335,
+        11.7793
+      ]
+    },
+    "compiler": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "log_sha256": "fc8e3e57c65f1069501f757ff3ec5bd587b3d39e08514dae44129c3dc0fa648e"
+  },
+  "paired_control": {
+    "gate": {
+      "max_median_regression_fraction": 0.1,
+      "evaluation": "pass"
+    },
+    "configuration": {
+      "symbols": 512,
+      "dimensions": 384,
+      "normalized_vectors": true,
+      "unique_context_key_count": 512,
+      "top_k": 1,
+      "warmup_calls_per_side": 128,
+      "measured_process_runs_per_side": 10,
+      "iterations_per_process": 1000,
+      "startup_and_fixture_creation_in_inner_timer": false
+    },
+    "summary": {
+      "paired_fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+      "baseline_median_ns_per_search": 847897.4,
+      "baseline_range_ns_per_search": [
+        760814.8,
+        959472.7
+      ],
+      "candidate_median_ns_per_search": 848927.85,
+      "candidate_range_ns_per_search": [
+        806305.8,
+        877347.2
+      ],
+      "candidate_median_regression_fraction": 0.0012153003417629815,
+      "ten_percent_median_gate_pass": true,
+      "verdict": "inconclusive until limiter is profiled and mapped to source",
+      "limiter": "not profiled by this harness; helper times the public API loop only",
+      "rss_cpu_process_samples": {
+        "baseline": [
+          {
+            "peak_working_set_bytes": 13643776,
+            "cpu_time_ns": 875000000
+          },
+          {
+            "peak_working_set_bytes": 13643776,
+            "cpu_time_ns": 843750000
+          },
+          {
+            "peak_working_set_bytes": 13692928,
+            "cpu_time_ns": 937500000
+          },
+          {
+            "peak_working_set_bytes": 13684736,
+            "cpu_time_ns": 875000000
+          },
+          {
+            "peak_working_set_bytes": 13672448,
+            "cpu_time_ns": 937500000
+          },
+          {
+            "peak_working_set_bytes": 13697024,
+            "cpu_time_ns": 953125000
+          },
+          {
+            "peak_working_set_bytes": 13676544,
+            "cpu_time_ns": 1078125000
+          },
+          {
+            "peak_working_set_bytes": 13660160,
+            "cpu_time_ns": 1046875000
+          },
+          {
+            "peak_working_set_bytes": 13656064,
+            "cpu_time_ns": 1046875000
+          },
+          {
+            "peak_working_set_bytes": 13672448,
+            "cpu_time_ns": 921875000
+          }
+        ],
+        "candidate": [
+          {
+            "peak_working_set_bytes": 13697024,
+            "cpu_time_ns": 953125000
+          },
+          {
+            "peak_working_set_bytes": 13742080,
+            "cpu_time_ns": 984375000
+          },
+          {
+            "peak_working_set_bytes": 13688832,
+            "cpu_time_ns": 921875000
+          },
+          {
+            "peak_working_set_bytes": 13697024,
+            "cpu_time_ns": 906250000
+          },
+          {
+            "peak_working_set_bytes": 13701120,
+            "cpu_time_ns": 921875000
+          },
+          {
+            "peak_working_set_bytes": 13721600,
+            "cpu_time_ns": 953125000
+          },
+          {
+            "peak_working_set_bytes": 13701120,
+            "cpu_time_ns": 984375000
+          },
+          {
+            "peak_working_set_bytes": 13729792,
+            "cpu_time_ns": 984375000
+          },
+          {
+            "peak_working_set_bytes": 13684736,
+            "cpu_time_ns": 1000000000
+          },
+          {
+            "peak_working_set_bytes": 13680640,
+            "cpu_time_ns": 906250000
+          }
+        ]
+      }
+    },
+    "samples": [
+      {
+        "ordinal": 1,
+        "side": "baseline",
+        "elapsed_ns": 791341900,
+        "ns_per_search": 791341.9,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 2,
+        "side": "candidate",
+        "elapsed_ns": 856743600,
+        "ns_per_search": 856743.6,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 3,
+        "side": "baseline",
+        "elapsed_ns": 760814800,
+        "ns_per_search": 760814.8,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 4,
+        "side": "candidate",
+        "elapsed_ns": 834351200,
+        "ns_per_search": 834351.2,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 5,
+        "side": "baseline",
+        "elapsed_ns": 839018400,
+        "ns_per_search": 839018.4,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 6,
+        "side": "candidate",
+        "elapsed_ns": 806305800,
+        "ns_per_search": 806305.8,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 7,
+        "side": "baseline",
+        "elapsed_ns": 775838600,
+        "ns_per_search": 775838.6,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 8,
+        "side": "candidate",
+        "elapsed_ns": 836848800,
+        "ns_per_search": 836848.8,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 9,
+        "side": "baseline",
+        "elapsed_ns": 856776400,
+        "ns_per_search": 856776.4,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 10,
+        "side": "candidate",
+        "elapsed_ns": 861735800,
+        "ns_per_search": 861735.8,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 11,
+        "side": "baseline",
+        "elapsed_ns": 879808700,
+        "ns_per_search": 879808.7,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 12,
+        "side": "candidate",
+        "elapsed_ns": 877347200,
+        "ns_per_search": 877347.2,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 13,
+        "side": "baseline",
+        "elapsed_ns": 951795400,
+        "ns_per_search": 951795.4,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 14,
+        "side": "candidate",
+        "elapsed_ns": 871930300,
+        "ns_per_search": 871930.3,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 15,
+        "side": "baseline",
+        "elapsed_ns": 931498400,
+        "ns_per_search": 931498.4,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 16,
+        "side": "candidate",
+        "elapsed_ns": 869575800,
+        "ns_per_search": 869575.8,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 17,
+        "side": "baseline",
+        "elapsed_ns": 959472700,
+        "ns_per_search": 959472.7,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 18,
+        "side": "candidate",
+        "elapsed_ns": 841112100,
+        "ns_per_search": 841112.1,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 19,
+        "side": "baseline",
+        "elapsed_ns": 832250100,
+        "ns_per_search": 832250.1,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      },
+      {
+        "ordinal": 20,
+        "side": "candidate",
+        "elapsed_ns": 837662900,
+        "ns_per_search": 837662.9,
+        "fixture_sha256": "4f7d01293d4bfb74309f772c341fc887529ab5b326b85ccf690dec34d6f7772a",
+        "completed_results": 1000,
+        "path_evidence": {
+          "all_hnsw_keys_present_once": true,
+          "classification": "eligible_by_public_search_inputs_and_source_invariants; no success log is asserted",
+          "controlled_missing_graph_fallback": "passed exact top-result identity",
+          "hnsw_dimension": 384,
+          "hnsw_key_count": 512,
+          "symbols": 512,
+          "unique_context_keys": 512
+        },
+        "sidecar_check": "public hash_index::load equals expected ordered context keys"
+      }
+    ],
+    "candidate_only_positive_control": {
+      "comparison": "candidate-only absolute positive control; no baseline regression comparison",
+      "mode": "candidate_alias_control",
+      "passed": true,
+      "result_lines": [
+        1,
+        10
+      ],
+      "schema": "vex-library-perf/v1",
+      "symbols": 3,
+      "unique_context_keys": 2
+    },
+    "driver_sha256": "220e14285b0d5257aceb518c74b715df0878c5dc91afb32bf5126d1be9a4ed1d"
+  },
+  "helper_source_sha256": "c78803e6e0cd6835dc42d31261b5ec796b4b0510a3faa698457ef0f1646c3d96",
+  "limits": "Warm mapping/sidecar costs exclude HNSW graph open. The paired model-free API control includes per-call graph open, not actual inference. No profiler establishes a specific runtime limiter; speed difference remains inconclusive. Regular workspace tests include duplicated lib/bin test executions and ten ignored cases; the ignored mapping benchmark was executed explicitly as one passing release test."
+}

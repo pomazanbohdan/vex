@@ -10,6 +10,7 @@ use crate::util::config;
 mod lock;
 mod output;
 mod parse_files;
+mod semantic_migration;
 
 use lock::IndexLock;
 use output::{
@@ -36,158 +37,11 @@ use output::{
 #[allow(unused_imports)]
 pub use output::{__fuzz_incremental_hnsw_bytes, build_hnsw_at, build_hnsw_incremental_at};
 use parse_files::{
-    build_blob_cache, discover_files, hash_files_with_stat_cache, parse_files,
-    reconstruct_unchanged, StatCache,
+    apply_symbol_permutation, build_blob_cache, canonicalize_parsed_files_with_vectors,
+    discover_files, hash_files_with_stat_cache, parse_files, reconstruct_unchanged, StatCache,
 };
 
 const CHUNK_SIZE: usize = 500;
-
-struct MigrationVector {
-    symbol: crate::index::symbols::ParsedSymbol,
-    context: String,
-    hash: u64,
-    vector: Vec<f32>,
-}
-
-struct MigratedFiles {
-    files: Vec<crate::index::symbols::ParsedFile>,
-    vectors: Vec<Vec<f32>>,
-}
-
-fn collect_migration_vectors(
-    reader: &crate::store::reader::IndexReader,
-    manifest: &Manifest,
-    changed: &HashSet<&str>,
-    body_tokens: Option<&[Option<String>]>,
-    hash_path: &Path,
-) -> Option<(String, HashMap<String, Vec<MigrationVector>>)> {
-    let id = manifest.embedder_id.as_deref()?;
-    let dim = crate::embed::embedder_dim(id)? as usize;
-    if dim != reader.header().vector_dim as usize || manifest.vectors_normalized != Some(true) {
-        return None;
-    }
-    let budget = crate::embed::embedder_char_budget(id)?;
-    let bodies = body_tokens?;
-    let hashes = crate::search::hash_index::load(hash_path).ok()?;
-    if bodies.len() != reader.symbol_count() || hashes.len() != reader.symbol_count() {
-        return None;
-    }
-
-    let mut files: HashMap<String, Vec<MigrationVector>> = HashMap::new();
-    for (i, &hash) in hashes.iter().enumerate() {
-        let record = reader.symbol(i)?;
-        let path = reader.read_string(record.file_offset);
-        if changed.contains(path) {
-            continue;
-        }
-        let signature = reader.read_string(record.signature_offset);
-        let symbol = crate::index::symbols::ParsedSymbol {
-            name: reader.read_string(record.name_offset).to_string(),
-            kind: crate::index::symbols::SymbolKind::try_from(record.kind).ok()?,
-            line: record.line as usize,
-            signature: (!signature.is_empty()).then(|| signature.to_string()),
-            // SymbolRecord does not persist docs; hash validation below
-            // rejects prior vectors whose context depended on a doc.
-            doc: None,
-            body_tokens: bodies[i].clone(),
-        };
-        let context = crate::embed::build_context(
-            symbol.kind.as_str(),
-            &symbol.name,
-            path,
-            symbol.signature.as_deref(),
-            None,
-            symbol.body_tokens.as_deref(),
-            budget,
-        );
-        if crate::embed::cache::context_hash(id, &context) != hash {
-            return None;
-        }
-        let vector = reader.vector(record.vector_index)?.to_vec();
-        if vector.len() != dim || vector.iter().any(|v| !v.is_finite()) {
-            return None;
-        }
-        files
-            .entry(path.to_string())
-            .or_default()
-            .push(MigrationVector {
-                symbol,
-                context,
-                hash,
-                vector,
-            });
-    }
-    Some((id.to_string(), files))
-}
-
-fn reuse_migration_vectors(
-    fresh_files: Vec<crate::index::symbols::ParsedFile>,
-    embedder_id: &str,
-    mut old_files: HashMap<String, Vec<MigrationVector>>,
-) -> Result<MigratedFiles> {
-    let budget = crate::embed::embedder_char_budget(embedder_id)
-        .context("migration embedder has no known context budget")?;
-    let mut retained_files = Vec::new();
-    let mut retained_vectors = Vec::new();
-    let mut unembedded_files = Vec::new();
-
-    for fresh in fresh_files {
-        let Some(old) = old_files.remove(&fresh.path) else {
-            unembedded_files.push(fresh);
-            continue;
-        };
-        let mut old_by_key = HashMap::new();
-        let mut ambiguous = HashSet::new();
-        for (idx, prior) in old.iter().enumerate() {
-            let key = (prior.symbol.name.as_str(), prior.symbol.kind);
-            if old_by_key.insert(key, idx).is_some() {
-                ambiguous.insert(key);
-            }
-        }
-        let mut matched = Vec::with_capacity(fresh.symbols.len());
-        let mut used = HashSet::new();
-        let mut valid = old.len() == fresh.symbols.len();
-        for symbol in &fresh.symbols {
-            let key = (symbol.name.as_str(), symbol.kind);
-            let Some(&idx) = old_by_key.get(&key) else {
-                valid = false;
-                break;
-            };
-            if ambiguous.contains(&key) || !used.insert(idx) {
-                valid = false;
-                break;
-            }
-            let prior = &old[idx];
-            let context = crate::embed::build_context(
-                symbol.kind.as_str(),
-                &symbol.name,
-                &fresh.path,
-                symbol.signature.as_deref(),
-                symbol.doc.as_deref(),
-                symbol.body_tokens.as_deref(),
-                budget,
-            );
-            if context != prior.context
-                || crate::embed::cache::context_hash(embedder_id, &context) != prior.hash
-            {
-                valid = false;
-                break;
-            }
-            matched.push(idx);
-        }
-        if valid && matched.len() == old.len() {
-            retained_vectors.extend(matched.iter().map(|&idx| old[idx].vector.clone()));
-            retained_files.push(fresh);
-        } else {
-            unembedded_files.push(fresh);
-        }
-    }
-    retained_files.extend(unembedded_files);
-    Ok(MigratedFiles {
-        files: retained_files,
-        vectors: retained_vectors,
-    })
-}
 
 /// Build-time toggles for [`run`] and [`update`].
 ///
@@ -981,7 +835,7 @@ fn update_inner(
             .context("open existing index for incremental merge")?;
         if !parse_revision::is_current(&config::index_dir(&root)) && !opts.with_embeddings {
             let changed: HashSet<&str> = content_changed_paths.iter().map(String::as_str).collect();
-            migration_vectors = collect_migration_vectors(
+            migration_vectors = semantic_migration::collect_migration_vectors(
                 &reader,
                 &current_manifest,
                 &changed,
@@ -1149,6 +1003,12 @@ fn update_inner(
             .extend(std::iter::repeat_n(None, new_sym_count));
     }
 
+    anyhow::ensure!(
+        unchanged_vectors.len() <= unchanged_sym_count,
+        "reconstructed vector prefix exceeds unchanged symbol count"
+    );
+    let unchanged_vector_count = unchanged_vectors.len();
+
     // Generate embeddings for symbols in changed files. The E2b
     // embedding cache (`<index_dir>/embed_cache_<embedder_id>.bin`)
     // dedups by content-hash inside `generate_embeddings` — symbols
@@ -1174,26 +1034,29 @@ fn update_inner(
     } else {
         (Vec::new(), Vec::new())
     };
+    anyhow::ensure!(
+        new_vectors.len() <= new_sym_count,
+        "new vector prefix exceeds newly parsed symbol count"
+    );
+    let mut vector_source_symbols: Vec<usize> = (0..unchanged_vector_count).collect();
+    vector_source_symbols.extend(unchanged_sym_count..unchanged_sym_count + new_vectors.len());
 
-    // Merge: unchanged first (vectors align with symbol order)
     let mut all_parsed = unchanged_parsed;
     all_parsed.extend(newly_parsed);
-    let symbol_count: usize = all_parsed.iter().map(|f| f.symbols.len()).sum();
 
     let mut unchanged_count = unchanged_vectors.len();
     let mut all_vectors = unchanged_vectors;
     all_vectors.extend(new_vectors);
     let mut retained_embedder = None;
     if let Some((id, old_files)) = migration_vectors {
-        let migrated = reuse_migration_vectors(all_parsed, &id, old_files)?;
+        artefacts.cluster_carry = None;
+        let migrated = semantic_migration::reuse_migration_vectors(all_parsed, &id, old_files)?;
         all_parsed = migrated.files;
         all_vectors = migrated.vectors;
         unchanged_count = all_vectors.len();
+        vector_source_symbols = (0..all_vectors.len()).collect();
         if !all_vectors.is_empty() {
             retained_embedder = Some(id);
-            // Reordering parsed files to put reusable vectors in the writer's
-            // prefix can invalidate per-symbol cluster carry ordinals.
-            artefacts.cluster_carry = None;
         }
     }
     let semantic_embedder_id = if opts.with_embeddings {
@@ -1213,16 +1076,21 @@ fn update_inner(
     // already normalized; otherwise normalize everything (legacy
     // pre-1.13 lazy-promotion path).
     if existing_normalized {
-        // Only the freshly-embedded tail needs normalization.
-        for v in all_vectors[unchanged_count..].iter_mut() {
-            crate::search::semantic::normalize_in_place(v);
+        for vector in all_vectors.iter_mut().skip(unchanged_count) {
+            crate::search::semantic::normalize_in_place(vector);
         }
     } else {
-        for v in all_vectors.iter_mut() {
-            crate::search::semantic::normalize_in_place(v);
+        for vector in &mut all_vectors {
+            crate::search::semantic::normalize_in_place(vector);
         }
     }
-
+    canonicalize_update_sidecars(
+        &mut all_parsed,
+        &mut all_vectors,
+        &vector_source_symbols,
+        artefacts.cluster_carry.as_mut(),
+    );
+    let symbol_count: usize = all_parsed.iter().map(|f| f.symbols.len()).sum();
     let manifest_embedder = if all_vectors.is_empty() {
         None
     } else if opts.with_embeddings || retained_embedder.is_some() {
@@ -1244,7 +1112,7 @@ fn update_inner(
         &artefacts,
     )?;
 
-    if !all_vectors.is_empty() {
+    if !all_vectors.is_empty() && all_vectors.len() == symbol_count {
         let all_hashes = compute_hashes_for(&all_parsed, semantic_embedder_id)?;
         // v1.15.0 B1.2: try the incremental HNSW path first.
         //   Ok(true)  — incremental applied; HNSW + hash-index sidecar
@@ -1296,6 +1164,20 @@ fn update_inner(
     );
 
     Ok(Some((symbol_count, diff.changed.len(), diff.deleted.len())))
+}
+
+fn canonicalize_update_sidecars(
+    parsed: &mut [crate::index::symbols::ParsedFile],
+    vectors: &mut Vec<Vec<f32>>,
+    vector_source_symbols: &[usize],
+    cluster_carry: Option<&mut crate::index::types::ClusterCarryArtefacts>,
+) {
+    let symbol_permutation =
+        canonicalize_parsed_files_with_vectors(parsed, vectors, vector_source_symbols);
+    if let Some(carry) = cluster_carry {
+        apply_symbol_permutation(&mut carry.per_symbol_carried, &symbol_permutation);
+        apply_symbol_permutation(&mut carry.per_symbol_old_idx, &symbol_permutation);
+    }
 }
 
 #[cfg(test)]

@@ -102,7 +102,7 @@ fn wait_for_child(pid: u32) {
 }
 
 #[test]
-fn legacy_async_refresh_runs_exactly_once() {
+fn current_revision_async_refresh_runs_exactly_once() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().join("project");
     fs::create_dir_all(&root).unwrap();
