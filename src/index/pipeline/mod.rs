@@ -10,6 +10,7 @@ use crate::util::config;
 mod lock;
 mod output;
 mod parse_files;
+mod semantic_migration;
 
 use lock::IndexLock;
 use output::{
@@ -41,153 +42,6 @@ use parse_files::{
 };
 
 const CHUNK_SIZE: usize = 500;
-
-struct MigrationVector {
-    symbol: crate::index::symbols::ParsedSymbol,
-    context: String,
-    hash: u64,
-    vector: Vec<f32>,
-}
-
-struct MigratedFiles {
-    files: Vec<crate::index::symbols::ParsedFile>,
-    vectors: Vec<Vec<f32>>,
-}
-
-fn collect_migration_vectors(
-    reader: &crate::store::reader::IndexReader,
-    manifest: &Manifest,
-    changed: &HashSet<&str>,
-    body_tokens: Option<&[Option<String>]>,
-    hash_path: &Path,
-) -> Option<(String, HashMap<String, Vec<MigrationVector>>)> {
-    let id = manifest.embedder_id.as_deref()?;
-    let dim = crate::embed::embedder_dim(id)? as usize;
-    if dim != reader.header().vector_dim as usize || manifest.vectors_normalized != Some(true) {
-        return None;
-    }
-    let budget = crate::embed::embedder_char_budget(id)?;
-    let bodies = body_tokens?;
-    let hashes = crate::search::hash_index::load(hash_path).ok()?;
-    if bodies.len() != reader.symbol_count() || hashes.len() != reader.symbol_count() {
-        return None;
-    }
-
-    let mut files: HashMap<String, Vec<MigrationVector>> = HashMap::new();
-    for (i, &hash) in hashes.iter().enumerate() {
-        let record = reader.symbol(i)?;
-        let path = reader.read_string(record.file_offset);
-        if changed.contains(path) {
-            continue;
-        }
-        let signature = reader.read_string(record.signature_offset);
-        let symbol = crate::index::symbols::ParsedSymbol {
-            name: reader.read_string(record.name_offset).to_string(),
-            kind: crate::index::symbols::SymbolKind::try_from(record.kind).ok()?,
-            line: record.line as usize,
-            signature: (!signature.is_empty()).then(|| signature.to_string()),
-            // SymbolRecord does not persist docs; hash validation below
-            // rejects prior vectors whose context depended on a doc.
-            doc: None,
-            body_tokens: bodies[i].clone(),
-        };
-        let context = crate::embed::build_context(
-            symbol.kind.as_str(),
-            &symbol.name,
-            path,
-            symbol.signature.as_deref(),
-            None,
-            symbol.body_tokens.as_deref(),
-            budget,
-        );
-        if crate::embed::cache::context_hash(id, &context) != hash {
-            return None;
-        }
-        let vector = reader.vector(record.vector_index)?.to_vec();
-        if vector.len() != dim || vector.iter().any(|v| !v.is_finite()) {
-            return None;
-        }
-        files
-            .entry(path.to_string())
-            .or_default()
-            .push(MigrationVector {
-                symbol,
-                context,
-                hash,
-                vector,
-            });
-    }
-    Some((id.to_string(), files))
-}
-
-fn reuse_migration_vectors(
-    fresh_files: Vec<crate::index::symbols::ParsedFile>,
-    embedder_id: &str,
-    mut old_files: HashMap<String, Vec<MigrationVector>>,
-) -> Result<MigratedFiles> {
-    let budget = crate::embed::embedder_char_budget(embedder_id)
-        .context("migration embedder has no known context budget")?;
-    let mut retained_files = Vec::new();
-    let mut retained_vectors = Vec::new();
-    let mut unembedded_files = Vec::new();
-
-    for fresh in fresh_files {
-        let Some(old) = old_files.remove(&fresh.path) else {
-            unembedded_files.push(fresh);
-            continue;
-        };
-        let mut old_by_key = HashMap::new();
-        let mut ambiguous = HashSet::new();
-        for (idx, prior) in old.iter().enumerate() {
-            let key = (prior.symbol.name.as_str(), prior.symbol.kind);
-            if old_by_key.insert(key, idx).is_some() {
-                ambiguous.insert(key);
-            }
-        }
-        let mut matched = Vec::with_capacity(fresh.symbols.len());
-        let mut used = HashSet::new();
-        let mut valid = old.len() == fresh.symbols.len();
-        for symbol in &fresh.symbols {
-            let key = (symbol.name.as_str(), symbol.kind);
-            let Some(&idx) = old_by_key.get(&key) else {
-                valid = false;
-                break;
-            };
-            if ambiguous.contains(&key) || !used.insert(idx) {
-                valid = false;
-                break;
-            }
-            let prior = &old[idx];
-            let context = crate::embed::build_context(
-                symbol.kind.as_str(),
-                &symbol.name,
-                &fresh.path,
-                symbol.signature.as_deref(),
-                symbol.doc.as_deref(),
-                symbol.body_tokens.as_deref(),
-                budget,
-            );
-            if context != prior.context
-                || crate::embed::cache::context_hash(embedder_id, &context) != prior.hash
-            {
-                valid = false;
-                break;
-            }
-            matched.push(idx);
-        }
-        if valid && matched.len() == old.len() {
-            retained_vectors.extend(matched.iter().map(|&idx| old[idx].vector.clone()));
-            retained_files.push(fresh);
-        } else {
-            unembedded_files.push(fresh);
-        }
-    }
-    retained_files.extend(unembedded_files);
-    Ok(MigratedFiles {
-        files: retained_files,
-        vectors: retained_vectors,
-    })
-}
 
 /// Build-time toggles for [`run`] and [`update`].
 ///
@@ -981,7 +835,7 @@ fn update_inner(
             .context("open existing index for incremental merge")?;
         if !parse_revision::is_current(&config::index_dir(&root)) && !opts.with_embeddings {
             let changed: HashSet<&str> = content_changed_paths.iter().map(String::as_str).collect();
-            migration_vectors = collect_migration_vectors(
+            migration_vectors = semantic_migration::collect_migration_vectors(
                 &reader,
                 &current_manifest,
                 &changed,
@@ -1195,9 +1049,8 @@ fn update_inner(
     all_vectors.extend(new_vectors);
     let mut retained_embedder = None;
     if let Some((id, old_files)) = migration_vectors {
-        // Migration reorders parsed files; existing cluster ordinals still refer to pre-migration order.
         artefacts.cluster_carry = None;
-        let migrated = reuse_migration_vectors(all_parsed, &id, old_files)?;
+        let migrated = semantic_migration::reuse_migration_vectors(all_parsed, &id, old_files)?;
         all_parsed = migrated.files;
         all_vectors = migrated.vectors;
         unchanged_count = all_vectors.len();

@@ -1787,7 +1787,7 @@ pub fn build_hnsw_at(
     // so a single collision can't bring down the semantic channel.
     //
     // The on-disk hash sidecar stays sym_idx-aligned (full `hashes`
-    // slice, duplicates and all) — `src/search/semantic.rs:156` checks
+    // slice, duplicates and all) — `HnswHandle::open` checks
     // `hashes.len() == expected_symbols` at query open and bails to
     // brute force if they disagree. The reader at the same site already
     // dedups duplicate hashes via `entry().or_insert` (keeps first
