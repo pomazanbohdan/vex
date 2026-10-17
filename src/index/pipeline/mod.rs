@@ -36,8 +36,9 @@ use output::{
 #[allow(unused_imports)]
 pub use output::{__fuzz_incremental_hnsw_bytes, build_hnsw_at, build_hnsw_incremental_at};
 use parse_files::{
-    apply_symbol_permutation, build_blob_cache, canonicalize_parsed_files_with_vectors,
-    discover_files, hash_files_with_stat_cache, parse_files, reconstruct_unchanged, StatCache,
+    apply_symbol_permutation, build_blob_cache, canonicalize_parsed_files,
+    canonicalize_parsed_files_with_vectors, discover_files, hash_files_with_stat_cache,
+    parse_files, reconstruct_unchanged, StatCache,
 };
 
 const CHUNK_SIZE: usize = 500;
@@ -252,6 +253,9 @@ fn try_skip_update(
     if reader.header().version < crate::store::format::VERSION {
         return Ok(None);
     }
+    if opts.with_embeddings && reader.symbol_count() > 0 && !reader.has_vectors() {
+        return Ok(None);
+    }
     Ok(Some(reader.symbol_count()))
 }
 
@@ -389,11 +393,12 @@ fn run_with_lock(
         crate::search::semantic::normalize_in_place(v);
     }
 
-    let manifest_embedder = if opts.with_embeddings && !vectors.is_empty() {
-        Some(embedder_id.to_string())
-    } else {
-        None
-    };
+    let manifest_embedder =
+        if opts.with_embeddings && !vectors.is_empty() && vectors.len() == symbol_count {
+            Some(embedder_id.to_string())
+        } else {
+            None
+        };
     let vector_dim = vector_dim_for(embedder_id, &vectors);
     parse_revision::invalidate(&config::index_dir(root))?;
     write_output_locked(
@@ -635,6 +640,16 @@ fn update_inner(
         }
     }
 
+    let index_path = config::index_path(&root);
+    if opts.with_embeddings
+        && index_path.exists()
+        && current_manifest.embedder_id.as_deref() != Some(embedder_id)
+    {
+        tracing::info!("semantic request requires a full parse and embedding pass");
+        let (symbol_count, _) = run_with_lock(&root, opts, embedder_id, files, hashed, _lock)?;
+        return Ok(Some((symbol_count, diff.changed.len(), diff.deleted.len())));
+    }
+
     tracing::info!(
         changed = diff.changed.len(),
         deleted = diff.deleted.len(),
@@ -804,7 +819,6 @@ fn update_inner(
     // `Some(vec)` means the sidecar loaded successfully (zero-length
     // is a legitimate empty-index state, NOT failure — keeping these
     // distinct prevents the BM25-regression warning from misfiring).
-    let index_path = config::index_path(&root);
     let body_tokens_sidecar: Option<Vec<Option<String>>> = {
         let path = config::body_tokens_path(&root);
         if path.exists() {
@@ -824,7 +838,13 @@ fn update_inner(
             None
         }
     };
-    let (unchanged_parsed, unchanged_vectors, mut artefacts) = if index_path.exists() {
+    let (
+        unchanged_parsed,
+        unchanged_vectors,
+        unchanged_vector_source_symbols,
+        unchanged_mapping_valid,
+        mut artefacts,
+    ) = if index_path.exists() {
         let reader = crate::store::reader::IndexReader::open(&index_path)
             .context("open existing index for incremental merge")?;
         // P4b (`docs/V9-FORMAT.md` §13 R11) — built from THIS `reader`,
@@ -833,14 +853,30 @@ fn update_inner(
         // down. One reader generation for the whole carry, never a
         // second `IndexReader::open` that could observe a file some
         // concurrent writer changed in between.
-        let cluster_reader = reader.cluster_section_reader();
-        let recon = reconstruct_unchanged(
-            &reader,
-            &changed_set,
-            &deleted_set,
-            body_tokens_sidecar.as_deref(),
-            cluster_reader.as_ref(),
-        );
+        let recon = {
+            let cluster_reader = reader.cluster_section_reader();
+            reconstruct_unchanged(
+                &reader,
+                &changed_set,
+                &deleted_set,
+                body_tokens_sidecar.as_deref(),
+                cluster_reader.as_ref(),
+            )
+        };
+        if opts.with_embeddings && !recon.vector_mapping_valid {
+            tracing::warn!(
+                "invalid reconstructed vector mapping; rebuilding semantic index from source"
+            );
+            drop(reader);
+            let (symbol_count, _) = run_with_lock(&root, opts, embedder_id, files, hashed, _lock)?;
+            return Ok(Some((symbol_count, diff.changed.len(), diff.deleted.len())));
+        }
+        if opts.with_embeddings && reader.symbol_count() > 0 && !reader.has_vectors() {
+            tracing::info!("semantic request found no stored vectors; rebuilding from source");
+            drop(reader);
+            let (symbol_count, _) = run_with_lock(&root, opts, embedder_id, files, hashed, _lock)?;
+            return Ok(Some((symbol_count, diff.changed.len(), diff.deleted.len())));
+        }
         // Step (3) of the ordering invariant: no cascade importer
         // was reconstructed. `reconstruct_unchanged` skips anything
         // in `changed_set`, so this should hold transitively — but
@@ -886,7 +922,10 @@ fn update_inner(
         // update (unless the user opted out). `.and_then` (not `.map` +
         // `?`) is what makes "drop the carry" possible instead of
         // propagating an error.
-        let cluster_carry: Option<crate::index::types::ClusterCarryArtefacts> =
+        let cluster_carry: Option<crate::index::types::ClusterCarryArtefacts> = if recon
+            .cluster_carry_valid
+        {
+            let cluster_reader = reader.cluster_section_reader();
             cluster_reader.as_ref().and_then(|cr| {
                 let summary = cr.summary();
                 let Some(old_table) = build_old_table_from_records(summary.k, |ord| cr.record(ord))
@@ -922,11 +961,17 @@ fn update_inner(
                         h.flags & crate::store::format::ClusterHeader::FLAG_ITER_CAP_HIT != 0
                     }),
                 })
-            });
+            })
+        } else {
+            tracing::warn!("invalid reconstructed cluster mapping; dropping cluster carry");
+            None
+        };
 
         (
             recon.parsed_files,
             recon.vectors,
+            recon.vector_source_symbols,
+            recon.vector_mapping_valid,
             crate::index::types::IndexBuildArtefacts {
                 reconstructed_refs: recon.reconstructed_refs,
                 old_file_paths: recon.old_file_paths,
@@ -939,6 +984,8 @@ fn update_inner(
         (
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            true,
             crate::index::types::IndexBuildArtefacts::default(),
         )
     };
@@ -1022,7 +1069,7 @@ fn update_inner(
         new_vectors.len() <= new_sym_count,
         "new vector prefix exceeds newly parsed symbol count"
     );
-    let mut vector_source_symbols: Vec<usize> = (0..unchanged_vector_count).collect();
+    let mut vector_source_symbols = unchanged_vector_source_symbols;
     vector_source_symbols.extend(unchanged_sym_count..unchanged_sym_count + new_vectors.len());
 
     let mut all_parsed = unchanged_parsed;
@@ -1038,14 +1085,26 @@ fn update_inner(
             crate::search::semantic::normalize_in_place(vector);
         }
     }
-    canonicalize_update_sidecars(
+    let combined_mapping_valid = canonicalize_update_sidecars(
         &mut all_parsed,
         &mut all_vectors,
         &vector_source_symbols,
-        artefacts.cluster_carry.as_mut(),
+        &mut artefacts.cluster_carry,
     );
+    if opts.with_embeddings && (!unchanged_mapping_valid || !combined_mapping_valid) {
+        tracing::warn!(
+            "semantic request cannot use an invalid vector mapping; rebuilding from source"
+        );
+        let (symbol_count, _) = run_with_lock(&root, opts, embedder_id, files, hashed, _lock)?;
+        return Ok(Some((symbol_count, diff.changed.len(), diff.deleted.len())));
+    }
     let symbol_count: usize = all_parsed.iter().map(|f| f.symbols.len()).sum();
-    let manifest_embedder = if opts.with_embeddings && !all_vectors.is_empty() {
+    let manifest_embedder = if opts.with_embeddings
+        && unchanged_mapping_valid
+        && combined_mapping_valid
+        && !all_vectors.is_empty()
+        && all_vectors.len() == symbol_count
+    {
         Some(embedder_id.to_string())
     } else {
         None
@@ -1122,14 +1181,31 @@ fn canonicalize_update_sidecars(
     parsed: &mut [crate::index::symbols::ParsedFile],
     vectors: &mut Vec<Vec<f32>>,
     vector_source_symbols: &[usize],
-    cluster_carry: Option<&mut crate::index::types::ClusterCarryArtefacts>,
-) {
-    let symbol_permutation =
-        canonicalize_parsed_files_with_vectors(parsed, vectors, vector_source_symbols);
-    if let Some(carry) = cluster_carry {
-        apply_symbol_permutation(&mut carry.per_symbol_carried, &symbol_permutation);
-        apply_symbol_permutation(&mut carry.per_symbol_old_idx, &symbol_permutation);
+    cluster_carry: &mut Option<crate::index::types::ClusterCarryArtefacts>,
+) -> bool {
+    let (vector_mapping_valid, symbol_permutation) = match canonicalize_parsed_files_with_vectors(
+        parsed,
+        vectors,
+        vector_source_symbols,
+    ) {
+        Ok(permutation) => (true, permutation),
+        Err(err) => {
+            tracing::warn!(error = %err, "invalid incremental vector mapping; dropping vectors");
+            vectors.clear();
+            (false, canonicalize_parsed_files(parsed))
+        }
+    };
+    if let Some(carry) = cluster_carry.as_mut() {
+        let aligned = carry.per_symbol_carried.len() == symbol_permutation.len()
+            && carry.per_symbol_old_idx.len() == symbol_permutation.len()
+            && apply_symbol_permutation(&mut carry.per_symbol_carried, &symbol_permutation).is_ok()
+            && apply_symbol_permutation(&mut carry.per_symbol_old_idx, &symbol_permutation).is_ok();
+        if !aligned {
+            tracing::warn!("invalid incremental cluster mapping; dropping cluster carry");
+            *cluster_carry = None;
+        }
     }
+    vector_mapping_valid
 }
 
 #[cfg(test)]
