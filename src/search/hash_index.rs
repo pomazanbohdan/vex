@@ -17,9 +17,10 @@
 //!
 //! ```text
 //! magic:        4 bytes "VEXH"
-//! version:      u32 = 1
+//! version:      u32 = 1 (public/unbound) or 2 (private/bound)
 //! count:        u32 (number of hashes)
-//! data:         count × u64 (sym_idx-ordered)
+//! v2 digest:    u64 (ordered symbol-mapping evidence)
+//! data:         count × u64 (sym_idx-ordered; follows digest in v2)
 //! ```
 //!
 //! No `embedder_id` field — the embed cache (`embed/cache.rs`) already
@@ -27,30 +28,42 @@
 //! which carries the embedder's dimension in its own header. Magic /
 //! version mismatch on load → discard, fall back to brute force.
 
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
+use crate::store::reader::IndexReader;
 use anyhow::{Context, Result};
+use xxhash_rust::xxh3::Xxh3Default;
 
 const MAGIC: &[u8; 4] = b"VEXH";
-const VERSION: u32 = 1;
+const VERSION_V1: u32 = 1;
+const VERSION_V2: u32 = 2;
 
 /// Bound on the count field. ~10M symbols is past anything legitimate
 /// (a 384-dim f32 vector blob alone would be 15 GB at that scale). The
 /// reader bails before allocating against a crafted count.
 const MAX_COUNT: u32 = 10_000_000;
 
-/// Atomic save: write to `.tmp`, then rename. Matches the convention
-/// used by `embed::cache::EmbedCache::save` and `store::writer` —
-/// half-written sidecars can't be mistaken for valid ones.
+pub(crate) fn matches_hnsw<'a>(
+    index: &usearch::Index,
+    expected_dim: usize,
+    unique_hashes: impl ExactSizeIterator<Item = &'a u64>,
+) -> bool {
+    index.dimensions() == expected_dim
+        && matches!(index.metric_kind(), usearch::MetricKind::Cos)
+        && index.size() > 0
+        && index.size() == unique_hashes.len()
+        && unique_hashes
+            .into_iter()
+            .all(|&hash| index.count(hash) == 1)
+}
+
+/// Atomically write a legacy v1 sidecar for compatibility callers.
 ///
-/// **Note (v1.15.0 C):** the production hot path
-/// (`pipeline::output::commit_hnsw_and_sidecar`) no longer calls this
-/// wrapper — it uses [`save_to_tmp`] directly so the HNSW and sidecar
-/// renames can be batched two-phase. `save` is retained as the
-/// convenience entry point for any future caller that wants a single-
-/// file atomic write without the two-phase orchestration. Unit tests
-/// in this module exercise both `save` and the split form.
+/// V1 stores hashes without ordered-symbol binding. Search validates graph
+/// structure and each returned vector, but cannot detect equal-vector symbol
+/// reassociation. Production indexing uses `save_bound_to_tmp` to publish v2
+/// together with the HNSW graph; rebuilding creates that stronger binding.
 #[allow(dead_code)]
 pub fn save(path: &Path, hashes: &[u64]) -> Result<()> {
     let tmp = path.with_extension("hashes.tmp");
@@ -64,22 +77,30 @@ pub fn save(path: &Path, hashes: &[u64]) -> Result<()> {
     Ok(())
 }
 
-/// v1.15.0 C — split out the "write tmp" half of [`save`] so the
-/// orchestrator in `pipeline::output` can do a two-phase atomic
-/// commit of the HNSW + sidecar pair: write both `.tmp` files,
-/// fsync, then rename both back-to-back. The inconsistency window
-/// (one renamed, one not) shrinks from "between two file-content
-/// writes" (~ms on a large sidecar) to "between two rename syscalls"
-/// (~μs) — small enough that `HnswHandle::open`'s size-check
-/// fallback rarely fires in practice.
-///
-/// `tmp_path` is the destination of the tmp write; the caller picks
-/// the path (typically `final_path.with_extension("hashes.tmp")`).
-/// On success the tmp file exists, is fsync'd, and is ready to be
-/// renamed to the final path via plain `std::fs::rename`. On
-/// failure the tmp file may exist in a partial state; callers
-/// should treat any error as a "tmp leak" they need to clean up.
+/// Write and fsync a legacy v1 temporary sidecar for compatibility callers.
+/// The caller owns rename and cleanup on failure. Production publication
+/// requires the sibling index and uses `save_bound_to_tmp` instead.
+#[allow(dead_code)]
 pub fn save_to_tmp(tmp_path: &Path, hashes: &[u64]) -> Result<()> {
+    write_sidecar(tmp_path, hashes, None)
+}
+
+/// Write a private v2 sidecar bound to the ordered symbols in `reader`.
+pub(crate) fn save_bound_to_tmp(
+    tmp_path: &Path,
+    hashes: &[u64],
+    reader: &IndexReader,
+) -> Result<()> {
+    let digest = mapping_digest(reader, hashes)?;
+    write_sidecar(tmp_path, hashes, Some(digest))
+}
+
+fn write_sidecar(tmp_path: &Path, hashes: &[u64], digest: Option<u64>) -> Result<()> {
+    let version = if digest.is_some() {
+        VERSION_V2
+    } else {
+        VERSION_V1
+    };
     // Match the read-side `MAX_COUNT` guard so a truncating `as u32` cast
     // can't silently write a wrong count for an index past 10M symbols —
     // the cast would otherwise produce a sidecar that `load` accepts as
@@ -93,10 +114,14 @@ pub fn save_to_tmp(tmp_path: &Path, hashes: &[u64]) -> Result<()> {
     let mut file = std::fs::File::create(tmp_path)
         .with_context(|| format!("create {}", tmp_path.display()))?;
     file.write_all(MAGIC).context("write magic")?;
-    file.write_all(&VERSION.to_le_bytes())
+    file.write_all(&version.to_le_bytes())
         .context("write version")?;
     file.write_all(&(hashes.len() as u32).to_le_bytes())
         .context("write count")?;
+    if let Some(digest) = digest {
+        file.write_all(&digest.to_le_bytes())
+            .context("write symbol-mapping digest")?;
+    }
     for h in hashes {
         file.write_all(&h.to_le_bytes()).context("write hash")?;
     }
@@ -115,7 +140,27 @@ pub fn save_to_tmp(tmp_path: &Path, hashes: &[u64]) -> Result<()> {
 /// want "absence ≡ no sidecar" semantics should check `path.exists()`
 /// first.
 pub fn load(path: &Path) -> Result<Vec<u64>> {
-    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    read_sidecar(path).map(|(_, hashes, _)| hashes)
+}
+
+pub(crate) fn load_for_hnsw(path: &Path, reader: &IndexReader) -> Result<Vec<u64>> {
+    let (_, hashes, digest) = read_sidecar(path)?;
+    anyhow::ensure!(
+        hashes.len() == reader.symbol_count(),
+        "hash-index count disagrees with index symbol count"
+    );
+    if let Some(digest) = digest {
+        anyhow::ensure!(
+            digest == mapping_digest(reader, &hashes)?,
+            "hash-index symbol mapping mismatch; re-run `vex index --semantic`"
+        );
+    }
+    Ok(hashes)
+}
+
+fn read_sidecar(path: &Path) -> Result<(u32, Vec<u64>, Option<u64>)> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut file = BufReader::new(file);
 
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic).context("read magic")?;
@@ -124,8 +169,8 @@ pub fn load(path: &Path) -> Result<Vec<u64>> {
     }
 
     let version = read_u32(&mut file).context("read version")?;
-    if version != VERSION {
-        anyhow::bail!("hash-index version mismatch: {} != {}", version, VERSION);
+    if version != VERSION_V1 && version != VERSION_V2 {
+        anyhow::bail!("hash-index version mismatch: {} not in [1, 2]", version);
     }
 
     let count = read_u32(&mut file).context("read count")?;
@@ -133,11 +178,47 @@ pub fn load(path: &Path) -> Result<Vec<u64>> {
         anyhow::bail!("hash-index count absurd: {} > {}", count, MAX_COUNT);
     }
 
+    let digest = if version == VERSION_V2 {
+        Some(read_u64(&mut file).context("read symbol-mapping digest")?)
+    } else {
+        None
+    };
+
     let mut hashes: Vec<u64> = Vec::with_capacity(count as usize);
     for _ in 0..count {
         hashes.push(read_u64(&mut file).context("read hash")?);
     }
-    Ok(hashes)
+    Ok((version, hashes, digest))
+}
+
+fn mapping_digest(reader: &IndexReader, hashes: &[u64]) -> Result<u64> {
+    anyhow::ensure!(
+        hashes.len() == reader.symbol_count(),
+        "hash-index count {} disagrees with index symbol count {}",
+        hashes.len(),
+        reader.symbol_count()
+    );
+    let mut hasher = Xxh3Default::new();
+    hasher.update(&(hashes.len() as u64).to_le_bytes());
+    hasher.update(&reader.header().vector_dim.to_le_bytes());
+    for (idx, &hash) in hashes.iter().enumerate() {
+        let record = reader
+            .symbol(idx)
+            .with_context(|| format!("missing symbol record {idx} while binding hash sidecar"))?;
+        hasher.update(&hash.to_le_bytes());
+        hasher.update(&[record.kind]);
+        hasher.update(&record.line.to_le_bytes());
+        hasher.update(&record.vector_index.to_le_bytes());
+        update_string(&mut hasher, reader.read_string(record.file_offset));
+        update_string(&mut hasher, reader.read_string(record.name_offset));
+        update_string(&mut hasher, reader.read_string(record.signature_offset));
+    }
+    Ok(hasher.digest())
+}
+
+fn update_string(hasher: &mut Xxh3Default, value: &str) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
 }
 
 /// Fuzzing shim — exposed only to `vex-fuzz`. Writes `data` as a
@@ -223,7 +304,7 @@ mod tests {
         let p = tmp.path().join("h.bin");
         let mut bad = Vec::new();
         bad.extend_from_slice(b"NOPE");
-        bad.extend_from_slice(&VERSION.to_le_bytes());
+        bad.extend_from_slice(&VERSION_V1.to_le_bytes());
         bad.extend_from_slice(&0u32.to_le_bytes());
         std::fs::write(&p, bad).unwrap();
         assert!(load(&p).is_err());
@@ -242,6 +323,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_truncated_v2_mapping_header() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("h.bin");
+        let mut bad = Vec::new();
+        bad.extend_from_slice(MAGIC);
+        bad.extend_from_slice(&VERSION_V2.to_le_bytes());
+        bad.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&p, bad).unwrap();
+        assert!(load(&p).is_err());
+    }
+
+    #[test]
     fn rejects_absurd_count() {
         // A crafted count past `MAX_COUNT` would allocate a huge Vec
         // before reading the body fails — bail at the header instead.
@@ -249,7 +342,7 @@ mod tests {
         let p = tmp.path().join("h.bin");
         let mut bad = Vec::new();
         bad.extend_from_slice(MAGIC);
-        bad.extend_from_slice(&VERSION.to_le_bytes());
+        bad.extend_from_slice(&VERSION_V1.to_le_bytes());
         bad.extend_from_slice(&(MAX_COUNT + 1).to_le_bytes());
         std::fs::write(&p, bad).unwrap();
         assert!(load(&p).is_err());
@@ -264,7 +357,7 @@ mod tests {
         let p = tmp.path().join("h.bin");
         let mut bad = Vec::new();
         bad.extend_from_slice(MAGIC);
-        bad.extend_from_slice(&VERSION.to_le_bytes());
+        bad.extend_from_slice(&VERSION_V1.to_le_bytes());
         bad.extend_from_slice(&3u32.to_le_bytes());
         bad.extend_from_slice(&42u64.to_le_bytes());
         std::fs::write(&p, bad).unwrap();
@@ -279,5 +372,77 @@ mod tests {
         // "absence ≡ no sidecar" semantics; the loader doesn't decide
         // policy for them.
         assert!(load(&p).is_err());
+    }
+
+    #[test]
+    #[ignore = "release-mode 100k-symbol mapping cost measurement"]
+    fn mapping_cost_100k_symbols() {
+        use crate::index::symbols::{ParsedFile, ParsedSymbol, SymbolKind};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const COUNT: usize = 100_001;
+        const DIM: u32 = 384;
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index.vex");
+        let sidecar_path = tmp.path().join("index.hashes");
+        let parsed = vec![ParsedFile {
+            path: "src/representative/module/fixture.rs".into(),
+            symbols: (0..COUNT)
+                .map(|i| ParsedSymbol {
+                    name: format!("symbol_{i:06}"),
+                    kind: SymbolKind::Function,
+                    line: i + 1,
+                    signature: Some(format!("pub fn symbol_{i:06}(input: &str) -> bool")),
+                    doc: None,
+                    body_tokens: None,
+                })
+                .collect(),
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        let mut vector = vec![0.0; DIM as usize];
+        vector[0] = 1.0;
+        let vectors = vec![vector; COUNT];
+        crate::store::writer::write_index_full(&parsed, &vectors, DIM, &index_path).unwrap();
+        drop(vectors);
+        drop(parsed);
+        let hashes: Vec<u64> = (0..COUNT as u64).collect();
+        let reader = IndexReader::open(&index_path).unwrap();
+        save_bound_to_tmp(&sidecar_path, &hashes, &reader).unwrap();
+        let expected = mapping_digest(&reader, &hashes).unwrap();
+        for _ in 0..3 {
+            assert_eq!(mapping_digest(&reader, &hashes).unwrap(), expected);
+            assert_eq!(load_for_hnsw(&sidecar_path, &reader).unwrap(), hashes);
+        }
+        let mut digest_ns = Vec::new();
+        let mut sidecar_load_ns = Vec::new();
+        for _ in 0..30 {
+            let start = Instant::now();
+            let digest = black_box(mapping_digest(black_box(&reader), black_box(&hashes)).unwrap());
+            digest_ns.push(start.elapsed().as_nanos());
+            assert_eq!(digest, expected);
+            let start = Instant::now();
+            let loaded =
+                black_box(load_for_hnsw(black_box(&sidecar_path), black_box(&reader)).unwrap());
+            sidecar_load_ns.push(start.elapsed().as_nanos());
+            assert_eq!(loaded, hashes);
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "symbols": COUNT, "dimensions": DIM, "warmups": 3, "samples": 30,
+                "index_bytes": std::fs::metadata(index_path).unwrap().len(),
+                "sidecar_bytes": std::fs::metadata(sidecar_path).unwrap().len(),
+                "digest_ns": digest_ns, "sidecar_load_including_digest_ns": sidecar_load_ns,
+                "mapping_digest": expected,
+                "scope": "warm reader; fixture creation excluded; no HNSW graph open or model inference"
+            })
+        );
     }
 }
