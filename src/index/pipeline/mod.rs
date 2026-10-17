@@ -1054,7 +1054,6 @@ fn update_inner(
         unchanged_vectors.len() <= unchanged_sym_count,
         "reconstructed vector prefix exceeds unchanged symbol count"
     );
-    let unchanged_vector_count = unchanged_vectors.len();
 
     // Generate embeddings for symbols in changed files. The E2b
     // embedding cache (`<index_dir>/embed_cache_<embedder_id>.bin`)
