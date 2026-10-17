@@ -417,21 +417,26 @@ fn produce_results(
             );
         }
         check_embedder_match(root, &embedder_id)?;
-        let mut embedder =
-            crate::embed::make_embedder(&embedder_id).context("load embedding model")?;
+        let normalized = manifest.vectors_normalized.unwrap_or(false);
+        let query_vector =
+            crate::embed::query_cache::query_vector(&embedder_id, normalized, query)?;
         let hnsw_path = config::hnsw_path(root);
-        let semantic_results = semantic::search_with_embedder(
+        let semantic_results = semantic::search_with_vector(
             &reader,
-            embedder.as_mut(),
-            query,
+            query_vector,
             fetch_limit,
             &hnsw_path,
-            manifest.vectors_normalized.unwrap_or(false),
+            normalized,
         )?;
         if want_prefusion {
             trace_semantic = semantic_results.clone();
         }
-        fusion::fuse3(structural_results, bm25_results, semantic_results, limit)
+        fusion::fuse3(
+            structural_results,
+            bm25_results,
+            semantic_results,
+            fetch_limit,
+        )
     } else {
         if emit_diagnostics && semantic && !reader.has_vectors() {
             eprintln!("Warning: no embeddings in index. Run `vex index --semantic` first.");
@@ -440,7 +445,7 @@ fn produce_results(
             structural_results
         } else {
             // 2-channel fusion when semantic is off but BM25 is available.
-            fusion::fuse_many(vec![structural_results, bm25_results], limit)
+            fusion::fuse_many(vec![structural_results, bm25_results], fetch_limit)
         }
     };
 

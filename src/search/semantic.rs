@@ -3,28 +3,19 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use crate::embed::Embedder;
 use crate::index::symbols::SymbolKind;
 use crate::search::{hash_index, MatchType, SearchResult};
 use crate::store::reader::IndexReader;
 
-/// Semantic search using HNSW index (fast) with brute-force fallback.
-///
-/// `normalized` reflects the manifest's `vectors_normalized` flag —
-/// when `true`, the stored vectors are unit-length and the brute-force
-/// fallback uses dot product instead of full cosine. The query vector
-/// is normalized here so it matches.
-pub fn search_with_embedder(
+pub(crate) fn search_with_vector(
     reader: &IndexReader,
-    embedder: &mut dyn Embedder,
-    query: &str,
+    mut query_vec: Vec<f32>,
     top_k: usize,
     hnsw_path: &Path,
     normalized: bool,
 ) -> Result<Vec<SearchResult>> {
-    let mut query_vec = embedder.embed(query).context("embed query")?;
     if normalized {
         normalize_in_place(&mut query_vec);
     }

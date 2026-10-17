@@ -6,20 +6,45 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- The public Rust library API `vex::search::semantic::search_with_embedder` is
+  removed; downstream crates that import it must adapt before upgrading.
+
+### Added
+
+- Repeated identical one-shot CLI MiniLM semantic queries reuse bounded,
+  integrity-gated raw vectors across processes; MCP keeps its model warm.
+- **`install.sh`**: `curl -fsSL https://raw.githubusercontent.com/tenatarika/vex/main/install.sh | sh`
+  installs `vex` and `vex-mcp` from the latest release into `~/.local/bin`
+  (macOS arm64, Linux x86_64; `VEX_VERSION`, `VEX_INSTALL_DIR`, `VEX_NO_MCP`).
+  It refuses musl and glibc older than 2.34 with a pointer to a source build.
+- **`install.ps1`** for Windows:
+  `irm https://raw.githubusercontent.com/tenatarika/vex/main/install.ps1 | iex`
+  installs `vex.exe`, `vex-mcp.exe` and `DirectML.dll` into
+  `%LOCALAPPDATA%\Programs\vex` and adds it to the user `PATH`. CI runs it on
+  Windows under PowerShell 7 and 5.1.
+- **`cargo binstall vex-search` / `vex-search-mcp`** download the prebuilt
+  release binaries instead of compiling.
+
 ### Fixed
 
 - **Semantic HNSW results** preserve aliases and validate ordered symbol identity with v2 hash sidecars. Existing v1 sidecars remain usable with graph/key checks and per-result vector checks; they cannot detect equal-vector symbol reassociation. `vex index --semantic` rebuilds with v2 binding.
 - **Malformed semantic HNSW files** fall back to brute force when the complete serialized extent, including node payload, is truncated or inconsistent. USearch is pinned to 2.25.3 because this check mirrors its private layout.
 - **HNSW publication** requires a readable sibling `index.vex` and always writes a bound v2 sidecar.
-
-### Added
-
-- **`install.sh`**: `curl -fsSL https://raw.githubusercontent.com/tenatarika/vex/main/install.sh | sh`
-  installs `vex` and `vex-mcp` from the latest release into `~/.local/bin`
-  (macOS arm64, Linux x86_64; `VEX_VERSION`, `VEX_INSTALL_DIR`, `VEX_NO_MCP`).
-  It refuses musl and glibc older than 2.34 with a pointer to a source build.
-- **`cargo binstall vex-search` / `vex-search-mcp`** download the prebuilt
-  release binaries instead of compiling.
+- **`usages --strict` matches the complete symbol name.** `Service` no longer
+  picks up references to `DerivedService` (the match is case-insensitive).
+- **Hierarchy edges resolve only to types** (struct, class, interface, trait,
+  enum, type alias). A parent name that matches only a function or method is
+  now reported as an unresolved parent instead of a wrong edge.
+- **Scoped `search` returns the full limit.** With `--filter-path`,
+  `--include`/`--exclude` or `--since`/`--changed-only`, the limit is applied
+  after scoping, so matches further down are no longer dropped.
+- **`tests-for` keeps same-named tests apart.** Two tests with the same name in
+  different files or lines are both reported.
+- **`grep --filter-path` works with either separator on Windows.** `src/api/`,
+  `src\api\` and mixed forms all match; matching stays a case-sensitive
+  substring and results keep native paths.
 
 ## [1.27.4] - 2026-10-06
 

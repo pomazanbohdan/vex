@@ -60,7 +60,7 @@ pub fn build_signals(
             .or_default();
         entry.semantic_rank = Some(i as u32);
         // Pre-fusion semantic SearchResult.score IS the raw cosine
-        // similarity (see `src/search/semantic.rs::search_with_embedder`
+        // similarity (see `src/search/semantic.rs::search_with_vector`
         // — `SearchResult::score` is set to the cosine before fusion).
         // Stored as f32 because cosines are computed in f32 and the
         // downcast is lossless for the f32 input range.
