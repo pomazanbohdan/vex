@@ -9,7 +9,9 @@ which grammar version each release ships against.
 
 ## Version matrix
 
-Non-Dart matrix baseline: **2026-05-14** (vex 1.4.3). Dart coverage is documented in [Dart indexing](DART_SUPPORT.md).
+Last verified: **2026-05-14** (vex 1.4.3).
+
+This historical baseline covers the non-Dart rows. See [Dart indexing](DART_SUPPORT.md) for Dart coverage and limits.
 
 | Language | Extensions | Grammar crate | Grammar version | Symbol kinds extracted | `implementations` |
 |---|---|---|---|---|---|
