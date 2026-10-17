@@ -119,7 +119,8 @@ fastembed = "5.13"
 ort = { version = "=2.0.0-rc.12", default-features = false, optional = true }
 
 # HNSW vector index
-usearch = "2.25"
+# hnsw_view_preflight mirrors this version's private serialization layout.
+usearch = "=2.25.3"
 
 # FST for refs lookup (zero-copy, prefix/fuzzy search)
 fst = { version = "0.4", features = ["levenshtein"] }

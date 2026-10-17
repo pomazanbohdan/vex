@@ -1614,6 +1614,17 @@ fn commit_hnsw_and_sidecar(
 ) -> Result<()> {
     let hnsw_tmp = hnsw_path.with_extension("hnsw.tmp");
     let hash_tmp = hash_index_path.with_extension("hashes.tmp");
+    let index_path = hnsw_path.with_file_name("index.vex");
+    let reader = crate::store::reader::IndexReader::open(&index_path).with_context(|| {
+        format!(
+            "open sibling index {} for HNSW mapping",
+            index_path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        hashes.len() == reader.symbol_count(),
+        "HNSW hash/symbol count mismatch"
+    );
 
     // Phase 1: write both tmps (durable on disk after fsync). usearch
     // doesn't expose an fsync hook on its save path, but a buggy or
@@ -1626,21 +1637,7 @@ fn commit_hnsw_and_sidecar(
     index
         .save(hnsw_tmp_str)
         .with_context(|| format!("save HNSW to {}", hnsw_tmp.display()))?;
-    let index_path = hnsw_path.with_file_name("index.vex");
-    let sidecar_result = match index_path.try_exists() {
-        Ok(true) => crate::store::reader::IndexReader::open(&index_path)
-            .with_context(|| {
-                format!(
-                    "open sibling index {} for HNSW mapping",
-                    index_path.display()
-                )
-            })
-            .and_then(|reader| {
-                crate::search::hash_index::save_bound_to_tmp(&hash_tmp, hashes, &reader)
-            }),
-        Ok(false) => crate::search::hash_index::save_to_tmp(&hash_tmp, hashes),
-        Err(e) => Err(e).with_context(|| format!("inspect sibling index {}", index_path.display())),
-    };
+    let sidecar_result = crate::search::hash_index::save_bound_to_tmp(&hash_tmp, hashes, &reader);
     if let Err(e) = sidecar_result {
         // Sidecar tmp failed → HNSW tmp leaked; clean it up before
         // returning so the next run starts from a clean state.
@@ -2092,9 +2089,6 @@ pub fn build_hnsw_incremental_at(
     // sidecar old" mismatch. The two-phase commit shrinks that window
     // to ~μs (two adjacent rename syscalls).
     //
-    // `commit_hnsw_and_sidecar` returns Err iff one of the renames
-    // failed — that's the only path that bubbles up, matching the
-    // Err contract documented at the function head.
     commit_hnsw_and_sidecar(index, hnsw_path, hash_index_path, new_hashes)
         .context("HNSW incremental: two-phase commit")?;
 
@@ -2141,6 +2135,31 @@ pub fn build_hnsw_incremental_at(
 pub fn __fuzz_incremental_hnsw_bytes(data: &[u8]) {
     use std::sync::OnceLock;
 
+    fn write_fixture(path: &Path, vectors: &[Vec<f32>], dim: usize) -> Result<()> {
+        use crate::index::symbols::{ParsedFile, ParsedSymbol, SymbolKind};
+        let parsed = vec![ParsedFile {
+            path: "fuzz.rs".into(),
+            symbols: (0..vectors.len())
+                .map(|i| ParsedSymbol {
+                    name: format!("symbol_{i}"),
+                    kind: SymbolKind::Function,
+                    line: i + 1,
+                    signature: None,
+                    doc: None,
+                    body_tokens: None,
+                })
+                .collect(),
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(&parsed, vectors, dim as u32, path)
+    }
+
     // One-time baseline build. 8 vectors at dim 8 — small enough that
     // each fuzz iteration's HNSW load + mutate completes in <1ms,
     // dense enough to exercise usearch's neighbour-link relaxation.
@@ -2163,6 +2182,7 @@ pub fn __fuzz_incremental_hnsw_bytes(data: &[u8]) {
             })
             .collect();
         let hashes: Vec<u64> = (0..8).map(|i| 0xCAFE_0000_u64 + i as u64).collect();
+        write_fixture(&baseline_dir.join("index.vex"), &vectors, FUZZ_DIM).expect("baseline index");
         build_hnsw_at(&baseline_hnsw, &baseline_hash, &vectors, &hashes)
             .expect("baseline build_hnsw_at — fuzz harness setup");
         (baseline_hnsw, baseline_hash, FUZZ_DIM)
@@ -2228,7 +2248,9 @@ pub fn __fuzz_incremental_hnsw_bytes(data: &[u8]) {
     // Drive incremental. Result discarded — Ok(true), Ok(false), or
     // any Err is acceptable. Only a panic / abort signals a real
     // defect. The function MUST be total over byte-sequence input.
-    let _ = build_hnsw_incremental_at(&scratch_hnsw, &scratch_hash, &new_vectors, &new_hashes);
+    if write_fixture(&scratch_dir.join("index.vex"), &new_vectors, *dim).is_ok() {
+        let _ = build_hnsw_incremental_at(&scratch_hnsw, &scratch_hash, &new_vectors, &new_hashes);
+    }
 
     let _ = std::fs::remove_dir_all(&scratch_dir);
 }
@@ -2414,6 +2436,63 @@ mod tests {
         let (sym_idx, sim) = results[0];
         assert_eq!(sym_idx, 0, "top-1 must resolve to sym_idx 0 via hash map");
         assert!(sim > 0.99, "self-similarity should be ~1.0, got {sim}");
+
+        drop(handle);
+        crate::search::hash_index::save(&hash_index_path, &[h_foo, h_bar]).unwrap();
+        let legacy = crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader)
+            .expect("a matching legacy v1 sidecar must retain HNSW search");
+        let legacy_results = legacy.search_with_aliases(&v_foo, 1, &reader).unwrap();
+        assert_eq!(legacy_results.len(), 1);
+        assert_eq!(legacy_results[0].0, 0);
+        assert!(legacy_results[0].1 > 0.99);
+        drop(legacy);
+        crate::search::hash_index::save(&hash_index_path, &[h_bar, h_foo]).unwrap();
+        let stale_legacy = crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader)
+            .expect("v1 cannot detect reordering at open");
+        assert!(
+            stale_legacy
+                .search_with_aliases(&v_foo, 1, &reader)
+                .is_none(),
+            "a queried v1 key must reject a mismatched current vector"
+        );
+    }
+
+    #[test]
+    fn hnsw_publication_requires_sibling_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let hnsw_path = tmp.path().join("index.hnsw");
+        let sidecar_path = tmp.path().join("index.hashes");
+        let mut vector = vec![0.0_f32; MINILM_DIM as usize];
+        vector[0] = 1.0;
+        build_hnsw_at(&hnsw_path, &sidecar_path, &[vector], &[7])
+            .expect_err("publication without a sibling index must fail");
+        for path in [
+            hnsw_path.clone(),
+            sidecar_path.clone(),
+            hnsw_path.with_extension("hnsw.tmp"),
+            sidecar_path.with_extension("hashes.tmp"),
+        ] {
+            assert!(!path.exists(), "unexpected publication artifact {path:?}");
+        }
+    }
+
+    #[test]
+    fn missing_sibling_preserves_published_pair_for_full_and_incremental_builds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut vector = vec![0.0; MINILM_DIM as usize];
+        vector[0] = 1.0;
+        let vectors = vec![vector];
+        let hashes = vec![7];
+        let (graph, sidecar) = make_seed_hnsw(&tmp, &hashes, &vectors);
+        let graph_before = std::fs::read(&graph).unwrap();
+        let sidecar_before = std::fs::read(&sidecar).unwrap();
+        std::fs::remove_file(tmp.path().join("index.vex")).unwrap();
+        assert!(build_hnsw_at(&graph, &sidecar, &vectors, &hashes).is_err());
+        assert!(build_hnsw_incremental_at(&graph, &sidecar, &vectors, &hashes).is_err());
+        assert_eq!(std::fs::read(&graph).unwrap(), graph_before);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_before);
+        assert!(!graph.with_extension("hnsw.tmp").exists());
+        assert!(!sidecar.with_extension("hashes.tmp").exists());
     }
 
     #[test]
@@ -2529,7 +2608,7 @@ mod tests {
         build_hnsw_at(&hnsw_path, &sidecar_path, &[vector], &[hashes[0] ^ 1]).unwrap();
         std::fs::write(&sidecar_path, bound_sidecar).unwrap();
         assert_eq!(
-            crate::search::hash_index::load_bound(&sidecar_path, &reader).unwrap(),
+            crate::search::hash_index::load_for_hnsw(&sidecar_path, &reader).unwrap(),
             hashes
         );
         assert!(crate::search::semantic::HnswHandle::open(&hnsw_path, dim, &reader).is_none());
@@ -2548,8 +2627,32 @@ mod tests {
     ) -> (std::path::PathBuf, std::path::PathBuf) {
         let hnsw_path = tmp.path().join("index.hnsw");
         let hash_index_path = tmp.path().join("index.hashes");
+        write_fixture_index(tmp.path(), vectors);
         build_hnsw_at(&hnsw_path, &hash_index_path, vectors, hashes).expect("seed build_hnsw_at");
         (hnsw_path, hash_index_path)
+    }
+
+    fn write_fixture_index(dir: &Path, vectors: &[Vec<f32>]) {
+        let parsed = vec![ParsedFile {
+            path: "fixture.rs".into(),
+            symbols: (0..vectors.len())
+                .map(|i| mk_sym(&format!("sym_{i}"), i + 1))
+                .collect(),
+            refs: vec![],
+            call_edges: vec![],
+            bound_refs: vec![],
+            skeletons: vec![],
+            cpp_includes: vec![],
+            trigram_bloom: None,
+            hierarchy_captures: vec![],
+        }];
+        crate::store::writer::write_index_full(
+            &parsed,
+            vectors,
+            MINILM_DIM,
+            &dir.join("index.vex"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2743,6 +2846,7 @@ mod tests {
         // Drop entry 3, keep 0..=2 — that's 1 remove out of 4 = 25%.
         let v_new = v_seed[0..3].to_vec();
         let h_new = h_seed[0..3].to_vec();
+        write_fixture_index(tmp.path(), &v_new);
         let applied =
             build_hnsw_incremental_at(&hnsw_path, &hash_index_path, &v_new, &h_new).unwrap();
         assert!(
@@ -2768,6 +2872,7 @@ mod tests {
         let dim = MINILM_DIM as usize;
         let v = vec![vec![1.0_f32; dim]];
         let h = vec![0xAA_u64];
+        write_fixture_index(tmp.path(), &v);
         let result = build_hnsw_at(&hnsw_path, &hash_index_path, &v, &h);
         assert!(
             result.is_err(),

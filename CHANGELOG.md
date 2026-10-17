@@ -8,8 +8,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- **Semantic HNSW results** preserve aliases and reject stale hash-to-symbol mappings via a versioned sidecar; legacy mappings safely fall back to brute force.
-- **Malformed semantic HNSW files** fall back to brute force when bounded header checks detect truncated or inconsistent file bounds.
+- **Semantic HNSW results** preserve aliases and validate ordered symbol identity with v2 sidecars. Legacy v1 sidecars remain usable after graph/key checks and per-result vector validation, but cannot detect equal-vector symbol reassociation; `vex index --semantic` rebuilds with v2 binding.
+- **Malformed semantic HNSW files** fall back to brute force when headers or the complete serialized extent, including node payload, are truncated or inconsistent. The payload check follows USearch 2.25.3's private layout.
+- **HNSW publication** requires a readable sibling `index.vex` and always writes a bound v2 sidecar.
 
 ### Added
 
