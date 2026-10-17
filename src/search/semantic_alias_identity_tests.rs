@@ -1,38 +1,14 @@
 use std::path::Path;
 
+use super::search_with_vector;
+use crate::embed::cache::context_hash;
+use crate::embed::{build_context, MINILM_CHAR_BUDGET, MINILM_DIM, MINILM_ID};
+use crate::index::pipeline::build_hnsw_at;
+use crate::index::symbols::{ParsedFile, ParsedSymbol, SymbolKind};
+use crate::search::hash_index;
+use crate::store::reader::IndexReader;
+use crate::store::writer::write_index_full;
 use tempfile::TempDir;
-use vex::embed::cache::context_hash;
-use vex::embed::{build_context, Embedder, MINILM_CHAR_BUDGET, MINILM_DIM, MINILM_ID};
-use vex::index::pipeline::build_hnsw_at;
-use vex::index::symbols::{ParsedFile, ParsedSymbol, SymbolKind};
-use vex::search::hash_index;
-use vex::search::semantic::search_with_embedder;
-use vex::store::reader::IndexReader;
-use vex::store::writer::write_index_full;
-
-struct FixtureEmbedder;
-
-impl Embedder for FixtureEmbedder {
-    fn id(&self) -> &'static str {
-        MINILM_ID
-    }
-
-    fn dim(&self) -> u32 {
-        MINILM_DIM
-    }
-
-    fn char_budget(&self) -> usize {
-        MINILM_CHAR_BUDGET
-    }
-
-    fn embed(&mut self, _: &str) -> anyhow::Result<Vec<f32>> {
-        Ok(one_hot(0))
-    }
-
-    fn embed_batch(&mut self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        texts.iter().map(|_| self.embed("")).collect()
-    }
-}
 
 fn one_hot(slot: usize) -> Vec<f32> {
     let mut vector = vec![0.0; MINILM_DIM as usize];
@@ -120,8 +96,7 @@ fn hnsw_prebaked_aliases_keep_both_symbols() {
     );
     let reader = IndexReader::open(&index_path).unwrap();
 
-    let results =
-        search_with_embedder(&reader, &mut FixtureEmbedder, "query", 1, &hnsw_path, true).unwrap();
+    let results = search_with_vector(&reader, one_hot(0), 1, &hnsw_path, true).unwrap();
     assert_eq!(results.iter().map(|r| r.line).collect::<Vec<_>>(), [1, 10]);
 }
 
@@ -141,8 +116,7 @@ fn hnsw_rejects_foreign_graph() {
     std::fs::write(&sidecar_path, bound_sidecar).unwrap();
     let reader = IndexReader::open(&index_path).unwrap();
 
-    let results =
-        search_with_embedder(&reader, &mut FixtureEmbedder, "query", 2, &hnsw_path, true).unwrap();
+    let results = search_with_vector(&reader, one_hot(0), 2, &hnsw_path, true).unwrap();
     assert_eq!(
         results[0].line, 1,
         "foreign graph must not remap identities"
@@ -160,8 +134,7 @@ fn hnsw_reorder_does_not_remap_identity() {
     write_graph(&hnsw_path, &vectors, &symbol_hashes(&files));
     let reader = IndexReader::open(&index_path).unwrap();
 
-    let results =
-        search_with_embedder(&reader, &mut FixtureEmbedder, "query", 2, &hnsw_path, true).unwrap();
+    let results = search_with_vector(&reader, one_hot(0), 2, &hnsw_path, true).unwrap();
     assert_eq!(
         results[0].line, 1,
         "vector identity must follow reordered records"
@@ -182,8 +155,7 @@ fn hnsw_stale_sidecar_order_falls_back_after_reorder() {
     write_index(&index_path, &current_files, &same_vectors);
     let reader = IndexReader::open(&index_path).unwrap();
 
-    let results =
-        search_with_embedder(&reader, &mut FixtureEmbedder, "query", 2, &hnsw_path, true).unwrap();
+    let results = search_with_vector(&reader, one_hot(0), 2, &hnsw_path, true).unwrap();
     assert_eq!(results.len(), 2, "stale mapping safely falls back");
 }
 
@@ -198,8 +170,7 @@ fn hnsw_rejects_same_keys_with_wrong_vectors() {
     write_graph(&hnsw_path, &[one_hot(1), one_hot(0)], &hashes);
     let reader = IndexReader::open(&index_path).unwrap();
 
-    let results =
-        search_with_embedder(&reader, &mut FixtureEmbedder, "query", 2, &hnsw_path, true).unwrap();
+    let results = search_with_vector(&reader, one_hot(0), 2, &hnsw_path, true).unwrap();
     assert_eq!(
         results[0].line, 1,
         "same-key stale vectors must be rejected"

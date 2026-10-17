@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::index::symbols::SymbolKind;
 use crate::search::{hash_index, MatchType, SearchResult};
@@ -581,3 +581,11 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "semantic_alias_identity_tests.rs"]
+mod hnsw_alias_identity_tests;
+
+#[cfg(test)]
+#[path = "semantic_pipeline_order_tests.rs"]
+mod hnsw_pipeline_order_tests;
