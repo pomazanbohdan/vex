@@ -11,6 +11,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`grep --filter-path` on Windows** accepts forward, backward and mixed
   path separators while preserving case-sensitive substring matching and
   native paths in results.
+- Hierarchy edges resolve only against type symbols, preserving external and ambiguous parent handling.
+- Strict usages now match complete native symbol names case-insensitively.
 
 ### Added
 
@@ -20,6 +22,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   It refuses musl and glibc older than 2.34 with a pointer to a source build.
 - **`cargo binstall vex-search` / `vex-search-mcp`** download the prebuilt
   release binaries instead of compiling.
+
+### Fixed
+
+- `tests-for` preserves same-named call sites by file and line.
+- Scoped search limits are applied after candidate fusion and filtering.
 
 ## [1.27.4] - 2026-10-06
 

@@ -11,16 +11,11 @@
 //!
 //! ## Identity model
 //!
-//! Traversal and the `visited` set both key on **function name only**,
-//! not `(name, path)`. On a polyglot codebase with many `new` / `run` /
-//! `process` definitions, all same-named functions collapse into a
-//! single graph node. This is a deliberate first-cut trade-off — keeps
-//! the BFS layer simple and matches the lowercased-name key used by
-//! the underlying call-graph FST. The `path` field on each step still
-//! carries the file from the matching call edge, so downstream output
-//! disambiguates per call site. A future revision could swap the key
-//! to `(name, file_id)` for stricter identity at the cost of a richer
-//! adjacency model.
+//! Traversal expansion keys on **function name only**, matching the
+//! underlying call-graph FST. `find_reachable` retains distinct result
+//! sites `(name, path, line)` while expanding each shared name once.
+//! Same-named functions still share adjacency: output sites are not
+//! compiler-resolved identities.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -156,9 +151,9 @@ fn dfs_paths<F>(
 
 /// Compute the transitive set of symbols whose callees reach `target`.
 ///
-/// Plain BFS backward from `target` through callers, with a `visited`
-/// set to prune cycles. Depth is the BFS level at which the symbol was
-/// discovered; `target` itself is *not* included in the output.
+/// Plain BFS backward from `target` through callers, with one set for
+/// expanded names and another for emitted sites. Depth is the BFS level at
+/// which the site was discovered; `target` itself is excluded from the output.
 pub fn find_reachable<F>(
     callers_of: F,
     target: &str,
@@ -171,8 +166,9 @@ where
     if max_hops == 0 || limit == 0 {
         return Vec::new();
     }
-    let mut visited: HashSet<String> = HashSet::new();
-    visited.insert(target.to_string());
+    let mut expanded_names: HashSet<String> = HashSet::new();
+    expanded_names.insert(target.to_string());
+    let mut emitted_sites = HashSet::new();
     let mut out: Vec<ReachableMatch> = Vec::new();
     let mut frontier: VecDeque<(String, usize)> = VecDeque::new();
     frontier.push_back((target.to_string(), 0));
@@ -181,7 +177,9 @@ where
             continue;
         }
         for caller in callers_of(&node) {
-            if !visited.insert(caller.name.clone()) {
+            if caller.name == target
+                || !emitted_sites.insert((caller.name.clone(), caller.path.clone(), caller.line))
+            {
                 continue;
             }
             out.push(ReachableMatch {
@@ -193,7 +191,9 @@ where
             if out.len() >= limit {
                 return out;
             }
-            frontier.push_back((caller.name, depth + 1));
+            if expanded_names.insert(caller.name.clone()) {
+                frontier.push_back((caller.name, depth + 1));
+            }
         }
     }
     out
@@ -354,6 +354,33 @@ mod tests {
         let callers = mock_graph(&[("D", "C", 1), ("E", "C", 2)]);
         let r = find_reachable(callers, "C", 6, 100);
         assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn callgraph_duplicate_edge_is_collapsed() {
+        let edge = CallMatch {
+            name: "caller".into(),
+            path: "tests/caller.rs".into(),
+            line: 7,
+        };
+        let callers = |name: &str| {
+            if name == "target" {
+                vec![edge.clone(), edge.clone()]
+            } else {
+                Vec::new()
+            }
+        };
+
+        let results = find_reachable(callers, "target", 2, 10);
+
+        assert_eq!(
+            results.len(),
+            1,
+            "duplicate call edge emitted twice: {results:?}"
+        );
+        assert_eq!(results[0].name, "caller");
+        assert_eq!(results[0].path, "tests/caller.rs");
+        assert_eq!(results[0].line, 7);
     }
 
     #[test]
