@@ -22,6 +22,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `tests-for` preserves same-named call sites by file and line.
 - Scoped search limits are applied after candidate fusion and filtering.
 
 ## [1.27.4] - 2026-10-06
