@@ -316,9 +316,13 @@ pub fn build_def_sites<'a>(
 ) -> HashMap<&'a str, HashSet<u32>> {
     let mut map: HashMap<&'a str, HashSet<u32>> = HashMap::new();
     let full_dart_name = symbol.to_lowercase();
+    let normalized_symbol = symbol.to_lowercase();
     if let Some(sym_fst) = reader.symbol_fst_reader() {
         for sym_idx in sym_fst.find(symbol) {
             if let Some(sym) = reader.symbol(sym_idx as usize) {
+                if reader.read_string(sym.name_offset).to_lowercase() != normalized_symbol {
+                    continue;
+                }
                 let file_path: &str = reader.read_string(sym.file_offset);
                 if file_path.ends_with(".dart")
                     && reader.read_string(sym.name_offset).to_lowercase() != full_dart_name
