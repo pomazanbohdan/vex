@@ -9,6 +9,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - Hierarchy edges resolve only against type symbols, preserving external and ambiguous parent handling.
+- Strict usages now match complete native symbol names case-insensitively.
 
 ### Added
 
