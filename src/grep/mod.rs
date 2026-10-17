@@ -308,6 +308,7 @@ fn discover_files(
     force_text: bool,
 ) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
+    let filter_path = filter_path.map(|fp| crate::util::paths::normalize_to_posix(fp.to_owned()));
 
     for entry in crate::util::walk::walk_builder(root, excludes)?.build() {
         let entry = entry?;
@@ -317,9 +318,10 @@ fn discover_files(
         let path = entry.into_path();
 
         // Optional path filter
-        if let Some(fp) = filter_path {
+        if let Some(fp) = filter_path.as_deref() {
             let rel = path.strip_prefix(root).unwrap_or(&path);
-            if !rel.to_string_lossy().contains(fp) {
+            let rel = crate::util::paths::normalize_to_posix(rel.to_string_lossy().into_owned());
+            if !rel.contains(fp) {
                 continue;
             }
         }
