@@ -106,20 +106,25 @@ impl<'a> RefReader<'a> {
 
     /// Prefix search: find all ref names starting with `prefix` and their entries.
     pub fn find_by_prefix(&self, prefix: &str) -> Vec<(String, Vec<RefEntry>)> {
+        let mut results = Vec::new();
+        self.for_each_by_prefix(prefix, |name, entries| {
+            results.push((name.to_owned(), entries.to_vec()));
+        });
+        results
+    }
+
+    /// Visit matching names in FST order, decoding only one posting list at a time.
+    pub fn for_each_by_prefix(&self, prefix: &str, mut visit: impl FnMut(&str, &[RefEntry])) {
         use fst::automaton::{Automaton, Str};
         use fst::{IntoStreamer, Streamer};
 
         let automaton = Str::new(prefix).starts_with();
         let mut stream = self.fst_map.search(automaton).into_stream();
-        let mut results = Vec::new();
-
         while let Some((key, offset)) = stream.next() {
-            let name = std::str::from_utf8(key).unwrap_or("").to_owned();
+            let name = std::str::from_utf8(key).unwrap_or("");
             let entries = self.read_posting_list(offset);
-            results.push((name, entries));
+            visit(name, &entries);
         }
-
-        results
     }
 
     #[cfg(test)]

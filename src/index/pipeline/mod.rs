@@ -36,8 +36,8 @@ use output::{
 #[allow(unused_imports)]
 pub use output::{__fuzz_incremental_hnsw_bytes, build_hnsw_at, build_hnsw_incremental_at};
 use parse_files::{
-    build_blob_cache, discover_files, hash_files_with_stat_cache, parse_files,
-    reconstruct_unchanged, StatCache,
+    apply_symbol_permutation, build_blob_cache, canonicalize_parsed_files_with_vectors,
+    discover_files, hash_files_with_stat_cache, parse_files, reconstruct_unchanged, StatCache,
 };
 
 const CHUNK_SIZE: usize = 500;
@@ -987,6 +987,12 @@ fn update_inner(
             .extend(std::iter::repeat_n(None, new_sym_count));
     }
 
+    anyhow::ensure!(
+        unchanged_vectors.len() <= unchanged_sym_count,
+        "reconstructed vector prefix exceeds unchanged symbol count"
+    );
+    let unchanged_vector_count = unchanged_vectors.len();
+
     // Generate embeddings for symbols in changed files. The E2b
     // embedding cache (`<index_dir>/embed_cache_<embedder_id>.bin`)
     // dedups by content-hash inside `generate_embeddings` — symbols
@@ -1012,34 +1018,33 @@ fn update_inner(
     } else {
         (Vec::new(), Vec::new())
     };
+    anyhow::ensure!(
+        new_vectors.len() <= new_sym_count,
+        "new vector prefix exceeds newly parsed symbol count"
+    );
+    let mut vector_source_symbols: Vec<usize> = (0..unchanged_vector_count).collect();
+    vector_source_symbols.extend(unchanged_sym_count..unchanged_sym_count + new_vectors.len());
 
-    // Merge: unchanged first (vectors align with symbol order)
     let mut all_parsed = unchanged_parsed;
     all_parsed.extend(newly_parsed);
-    let symbol_count: usize = all_parsed.iter().map(|f| f.symbols.len()).sum();
-
-    let unchanged_count = unchanged_vectors.len();
     let mut all_vectors = unchanged_vectors;
     all_vectors.extend(new_vectors);
-    // v1.13 P5: normalize the merged set so the result is always
-    // L2-normalized regardless of legacy state. Key subtlety: when the
-    // existing index is ALREADY normalized (v1.13+), re-normalizing
-    // unit vectors is a no-op mathematically but accumulates
-    // floating-point drift over many `vex update` cycles (watch mode).
-    // So skip the unchanged slice when the manifest confirms it's
-    // already normalized; otherwise normalize everything (legacy
-    // pre-1.13 lazy-promotion path).
     if existing_normalized {
-        // Only the freshly-embedded tail needs normalization.
-        for v in all_vectors[unchanged_count..].iter_mut() {
-            crate::search::semantic::normalize_in_place(v);
+        for vector in all_vectors.iter_mut().skip(unchanged_vector_count) {
+            crate::search::semantic::normalize_in_place(vector);
         }
     } else {
-        for v in all_vectors.iter_mut() {
-            crate::search::semantic::normalize_in_place(v);
+        for vector in &mut all_vectors {
+            crate::search::semantic::normalize_in_place(vector);
         }
     }
-
+    canonicalize_update_sidecars(
+        &mut all_parsed,
+        &mut all_vectors,
+        &vector_source_symbols,
+        artefacts.cluster_carry.as_mut(),
+    );
+    let symbol_count: usize = all_parsed.iter().map(|f| f.symbols.len()).sum();
     let manifest_embedder = if opts.with_embeddings && !all_vectors.is_empty() {
         Some(embedder_id.to_string())
     } else {
@@ -1059,7 +1064,7 @@ fn update_inner(
         &artefacts,
     )?;
 
-    if !all_vectors.is_empty() {
+    if !all_vectors.is_empty() && all_vectors.len() == symbol_count {
         let all_hashes = compute_hashes_for(&all_parsed, embedder_id)?;
         // v1.15.0 B1.2: try the incremental HNSW path first.
         //   Ok(true)  — incremental applied; HNSW + hash-index sidecar
@@ -1111,6 +1116,20 @@ fn update_inner(
     );
 
     Ok(Some((symbol_count, diff.changed.len(), diff.deleted.len())))
+}
+
+fn canonicalize_update_sidecars(
+    parsed: &mut [crate::index::symbols::ParsedFile],
+    vectors: &mut Vec<Vec<f32>>,
+    vector_source_symbols: &[usize],
+    cluster_carry: Option<&mut crate::index::types::ClusterCarryArtefacts>,
+) {
+    let symbol_permutation =
+        canonicalize_parsed_files_with_vectors(parsed, vectors, vector_source_symbols);
+    if let Some(carry) = cluster_carry {
+        apply_symbol_permutation(&mut carry.per_symbol_carried, &symbol_permutation);
+        apply_symbol_permutation(&mut carry.per_symbol_old_idx, &symbol_permutation);
+    }
 }
 
 #[cfg(test)]
