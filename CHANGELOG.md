@@ -10,13 +10,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - The public Rust library API `vex::search::semantic::search_with_embedder` is
   removed; downstream crates that import it must adapt before upgrading.
-
-### Fixed
-
-- **Semantic HNSW results** preserve aliases and validate ordered symbol identity with v2 sidecars. Legacy v1 sidecars remain usable after graph/key checks and per-result vector validation, but cannot detect equal-vector symbol reassociation; `vex index --semantic` rebuilds with v2 binding.
-- **Malformed semantic HNSW files** fall back to brute force when headers or the complete serialized extent, including node payload, are truncated or inconsistent. The payload check follows USearch 2.25.3's private layout.
-- **HNSW publication** requires a readable sibling `index.vex` and always writes a bound v2 sidecar.
-
 ### Added
 
 - **Incremental parser-revision migration** retains semantic vectors only when model, dimension and exact context identity are validated.
@@ -39,6 +32,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Incremental updates preserve ordinary references from unchanged files,
   including files without symbols; older indexes are refreshed before they
   can be reported as current.
+- **Semantic HNSW results** preserve aliases and validate ordered symbol identity with v2 hash sidecars. Existing v1 sidecars remain usable with graph/key checks and per-result vector checks; they cannot detect equal-vector symbol reassociation. A stale v1 mapping can also omit symbols outside the graph's top-k without detecting a mismatch. `vex index --semantic` rebuilds with v2 binding.
+- **Malformed semantic HNSW files** fall back to brute force when the complete serialized extent, including node payload, is truncated or inconsistent. USearch is pinned to 2.25.3 because this check mirrors its private layout.
+- **HNSW publication** requires a readable sibling `index.vex` and always writes a bound v2 sidecar.
 - **`usages --strict` matches the complete symbol name.** `Service` no longer
   picks up references to `DerivedService` (the match is case-insensitive).
 - **Hierarchy edges resolve only to types** (struct, class, interface, trait,

@@ -503,6 +503,34 @@ mod tests {
     }
 
     #[test]
+    fn hnsw_view_preflight_accepts_real_connectivity_layouts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for connectivity in [4, 16, 32] {
+            let path = tmp.path().join(format!("graph-{connectivity}.hnsw"));
+            let graph = usearch::new_index(&usearch::IndexOptions {
+                dimensions: 384,
+                connectivity,
+                metric: usearch::MetricKind::Cos,
+                quantization: usearch::ScalarKind::F32,
+                ..Default::default()
+            })
+            .unwrap();
+            graph.reserve(64).unwrap();
+            for key in 0..64 {
+                let mut vector = vec![0.0; 384];
+                vector[key as usize] = 1.0;
+                graph.add(key, &vector).unwrap();
+            }
+            graph.save(path.to_str().unwrap()).unwrap();
+            drop(graph);
+            assert!(
+                hnsw_view_preflight(&path, 384).is_ok(),
+                "rejected complete graph with connectivity {connectivity}"
+            );
+        }
+    }
+
+    #[test]
     fn hnsw_view_preflight_rejects_malformed_bounds() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("index.hnsw");
