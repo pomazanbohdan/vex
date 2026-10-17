@@ -106,6 +106,50 @@ fn walk_for_refs(
 ) {
     let kind = node.kind();
 
+    if lang == Language::Dart {
+        if let Some((owner, suffix, qualified_name)) =
+            super::dart::call_identity(node, content.as_bytes())
+        {
+            let line = owner.start_position().row + 1;
+            let context = lines.get(line - 1).map(|l| l.trim().to_string());
+            let owner_name = owner.node_text(content.as_bytes());
+            if is_meaningful_identifier(owner_name) {
+                refs.push(ParsedRef {
+                    name: owner_name.to_string(),
+                    line,
+                    context: context.clone(),
+                });
+                if is_meaningful_identifier(&qualified_name) {
+                    refs.push(ParsedRef {
+                        name: qualified_name,
+                        line,
+                        context: context.clone(),
+                    });
+                }
+            }
+            let mut cursor = node.walk();
+            if node.kind() == "method_invocation" {
+                let function = node.child_by_field_name("function");
+                for child in node.children(&mut cursor) {
+                    if function.is_some_and(|function| function.id() == child.id()) {
+                        walk_type_arguments(child, content, lines, lang, refs);
+                    } else {
+                        walk_for_refs(child, content, lines, lang, refs);
+                    }
+                }
+            } else {
+                for child in node.children(&mut cursor) {
+                    if !contains_node(child, owner)
+                        && suffix.is_none_or(|suffix| !contains_node(child, suffix))
+                    {
+                        walk_for_refs(child, content, lines, lang, refs);
+                    }
+                }
+            }
+            return;
+        }
+    }
+
     // Comments — drop the whole subtree.
     if is_comment_kind(kind, lang) {
         return;
@@ -132,6 +176,9 @@ fn walk_for_refs(
     }
 
     if is_identifier_kind(kind) || (lang == Language::Dart && kind == "identifier_dollar_escaped") {
+        if lang == Language::Dart && super::dart::is_constructor_declaration_identifier(node) {
+            return;
+        }
         let text = node.node_text(content.as_bytes());
         if is_meaningful_identifier(text) {
             let line = node.start_position().row + 1;
@@ -148,6 +195,27 @@ fn walk_for_refs(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk_for_refs(child, content, lines, lang, refs);
+    }
+}
+
+fn contains_node(parent: tree_sitter::Node<'_>, target: tree_sitter::Node<'_>) -> bool {
+    parent.start_byte() <= target.start_byte() && parent.end_byte() >= target.end_byte()
+}
+
+fn walk_type_arguments(
+    node: tree_sitter::Node,
+    content: &str,
+    lines: &[&str],
+    lang: Language,
+    refs: &mut Vec<ParsedRef>,
+) {
+    if node.kind() == "type_arguments" {
+        walk_for_refs(node, content, lines, lang, refs);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_type_arguments(child, content, lines, lang, refs);
     }
 }
 

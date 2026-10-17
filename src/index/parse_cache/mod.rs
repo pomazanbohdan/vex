@@ -46,6 +46,7 @@
 pub mod git_blobs;
 
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
@@ -90,6 +91,16 @@ pub const MAGIC: &[u8; 4] = b"VXBC";
 /// reuse valid cache entries and do not bump this value.
 pub const CACHE_FORMAT_VERSION: u16 = 5;
 
+fn cache_fingerprint_for_lang(lang: Language) -> u32 {
+    let grammar_fingerprint = grammar_fingerprint_for_lang(lang);
+    if lang != Language::Dart {
+        return grammar_fingerprint;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (grammar_fingerprint, crate::index::parse_revision::DART).hash(&mut hasher);
+    hasher.finish() as u32
+}
+
 /// On-disk header size: 4 (magic) + 2 (version) + 4 (fingerprint).
 const HEADER_SIZE: usize = 10;
 
@@ -114,7 +125,7 @@ const PAYLOAD_OFFSET: usize = HEADER_SIZE + 1 + BLOOM_SLOT;
 /// and any future callers.
 pub(crate) fn encode_entry(lang: Language, pf: &ParsedFile) -> bincode::Result<Vec<u8>> {
     let payload = bincode::serialize(pf)?;
-    let fingerprint = grammar_fingerprint_for_lang(lang);
+    let fingerprint = cache_fingerprint_for_lang(lang);
     let mut buf = Vec::with_capacity(PAYLOAD_OFFSET + payload.len());
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&CACHE_FORMAT_VERSION.to_le_bytes());
@@ -177,7 +188,7 @@ impl BlobCache {
 
         // Validate grammar fingerprint.
         let stored_fp = u32::from_le_bytes([data[6], data[7], data[8], data[9]]);
-        let expected_fp = grammar_fingerprint_for_lang(lang);
+        let expected_fp = cache_fingerprint_for_lang(lang);
         if stored_fp != expected_fp {
             return None;
         }
@@ -367,5 +378,54 @@ impl BlobCache {
         );
         let shard = &sha[..2.min(sha.len())];
         self.root.join(shard).join(format!("{sha}.bin"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn parsed_file() -> ParsedFile {
+        ParsedFile {
+            path: "src/lib.rs".into(),
+            symbols: Vec::new(),
+            refs: Vec::new(),
+            call_edges: Vec::new(),
+            bound_refs: Vec::new(),
+            skeletons: Vec::new(),
+            cpp_includes: Vec::new(),
+            trigram_bloom: None,
+            hierarchy_captures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn old_dart_fingerprint_misses_and_non_dart_fingerprint_remains_valid() {
+        let dir = TempDir::new().unwrap();
+        let cache = BlobCache::new(dir.path().join("blobs"));
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+
+        let rust_path = cache.entry_path(sha);
+        fs::create_dir_all(rust_path.parent().unwrap()).unwrap();
+        fs::write(
+            &rust_path,
+            encode_entry(Language::Rust, &parsed_file()).unwrap(),
+        )
+        .unwrap();
+        let rust_bytes = fs::read(&rust_path).unwrap();
+        assert!(cache.lookup(sha, Language::Rust).is_some());
+
+        let dart_sha = "abcdef0123456789abcdef0123456789abcdef01";
+        let dart_path = cache.entry_path(dart_sha);
+        fs::create_dir_all(dart_path.parent().unwrap()).unwrap();
+        let mut old_entry = encode_entry(Language::Dart, &parsed_file()).unwrap();
+        old_entry[6..10]
+            .copy_from_slice(&grammar_fingerprint_for_lang(Language::Dart).to_le_bytes());
+        fs::write(&dart_path, old_entry).unwrap();
+        let old_dart_bytes = fs::read(&dart_path).unwrap();
+        assert!(cache.lookup(dart_sha, Language::Dart).is_none());
+        assert_eq!(fs::read(&rust_path).unwrap(), rust_bytes);
+        assert_eq!(fs::read(&dart_path).unwrap(), old_dart_bytes);
     }
 }

@@ -63,11 +63,11 @@ fn dart_constructor_collision_preserves_transitive_subtypes() {
         assert!(parsed
             .symbols
             .iter()
-            .any(|s| s.name == name && s.kind == SymbolKind::Method));
+            .any(|s| s.name == format!("{name}.new") && s.kind == SymbolKind::Method));
         assert!(parsed
             .call_edges
             .iter()
-            .any(|edge| edge.callee_name == name));
+            .any(|edge| edge.callee_name == format!("{name}.new")));
     }
 }
 
@@ -95,7 +95,9 @@ fn dart_distinct_ambiguous_parent_types_remain_unresolved() {
 
 #[test]
 fn dart_usages_keep_superclass_refs_on_other_declarations() {
-    let dir = project("class Service {\n Service();\n}\nclass DerivedService extends Service {}\nvoid run() { Service(); }\n");
+    let dir = project(
+        "class Service {\n Service();\n}\nclass DerivedService extends Service {}\nvoid run() { Service(); }\n",
+    );
     let usages = json(dir.path(), &["usages", "Service"]);
     let results = usages["results"].as_array().unwrap();
     assert!(
@@ -139,31 +141,56 @@ fn dart_ast_refs_follow_the_common_meaningful_identifier_policy() {
 
 #[test]
 fn dart_refs_apply_shared_filter_to_other_language_keywords() {
-    let code_only = "void run() { open(); from(); type(); fn(); match(); Ok(); saveOrder(); Repository(); score_value; }";
-    let source = format!("void saveOrder() {{}} class Repository {{}}\n{code_only}\n");
+    let code_only = "void run() { open(); from(); type(); fn(); match(); Ok(); C(); saveOrder(); Repository(); Repo.loadNamed(); ordinaryValue.loadNamed(); score_value; }";
+    let source = format!(
+        "void saveOrder() {{}} class Repository {{}} class Repo {{ Repo.loadNamed(); }}\n{code_only}\n"
+    );
     let refs = extract_references_ast(&source, Language::Dart).unwrap();
-    let expected = ["Repository", "saveOrder", "score_value"];
+    let expected = [
+        "Repository",
+        "Repo",
+        "ordinaryValue",
+        "loadNamed",
+        "saveOrder",
+        "score_value",
+    ];
     for name in expected {
         assert!(
             refs.iter().any(|r| r.name == name && r.line == 2),
             "meaningful Dart use missing: {name}: {refs:?}"
         );
     }
-    for name in ["open", "from", "type", "fn", "match", "Ok"] {
+    for name in ["open", "from", "type", "fn", "match", "Ok", "C"] {
         assert!(
             !refs.iter().any(|r| r.name == name),
             "shared policy admitted {name}: {refs:?}"
         );
     }
     let ast_names: std::collections::BTreeSet<_> = refs.iter().map(|r| r.name.clone()).collect();
+    let qualified_names: std::collections::BTreeSet<_> = refs
+        .iter()
+        .filter(|r| r.name.contains('.'))
+        .map(|r| r.name.clone())
+        .collect();
     let regex_names: std::collections::BTreeSet<_> = extract_references(code_only)
         .iter()
         .map(|r| r.name.clone())
         .collect();
+    let ast_base_names: std::collections::BTreeSet<_> = ast_names
+        .iter()
+        .filter(|name| !name.contains('.'))
+        .cloned()
+        .collect();
     assert_eq!(
-        ast_names, regex_names,
-        "AST and shared regex filter diverged"
+        ast_base_names, regex_names,
+        "ordinary AST refs and the shared regex oracle diverged"
     );
+    assert_eq!(
+        qualified_names,
+        ["Repo.loadNamed".to_string(), "Repository.new".to_string()].into()
+    );
+    assert!(!ast_names.contains("Ok.new"));
+    assert!(!ast_names.contains("C.new"));
 
     let dir = project(&source);
     for name in expected {
@@ -174,7 +201,7 @@ fn dart_refs_apply_shared_filter_to_other_language_keywords() {
             "{name}: {usages}"
         );
     }
-    for name in ["open", "from", "type", "fn", "match", "Ok"] {
+    for name in ["open", "from", "type", "fn", "match", "Ok", "C"] {
         let usages = json(dir.path(), &["usages", name]);
         assert!(
             usages["results"].as_array().unwrap().is_empty(),

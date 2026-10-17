@@ -71,8 +71,19 @@ pub(crate) fn looks_like_test_name(name: &str) -> bool {
         || name.ends_with("Tests")
 }
 
-pub(crate) fn is_test_entry_name(name: &str, path: &str) -> bool {
-    looks_like_test_name(name) || (name == "main" && path.ends_with(".dart"))
+const LANGUAGE_ENTRY_NAMES: &[(crate::parse::language::Language, &[&str])] =
+    &[(crate::parse::language::Language::Dart, &["main"])];
+
+pub(crate) fn is_test_entry_name(
+    lang: Option<crate::parse::language::Language>,
+    name: &str,
+) -> bool {
+    looks_like_test_name(name)
+        || lang.is_some_and(|language| {
+            LANGUAGE_ENTRY_NAMES
+                .iter()
+                .any(|(entry_lang, names)| *entry_lang == language && names.contains(&name))
+        })
 }
 
 #[cfg(test)]
@@ -193,10 +204,10 @@ mod tests {
 
     #[test]
     fn dart_entry_name_preserves_native_and_utility_filters() {
-        assert!(is_test_entry_name("main", "sample_test.dart"));
-        assert!(is_test_entry_name("main", "integration_test/flow.dart"));
-        assert!(!is_test_entry_name("setupFixture", "sample_test.dart"));
-        assert!(!is_test_entry_name("main", "tests/integration.rs"));
-        assert!(is_test_entry_name("test_foo", "tests/integration.rs"));
+        use crate::parse::language::Language;
+        assert!(is_test_entry_name(Some(Language::Dart), "main"));
+        assert!(!is_test_entry_name(Some(Language::Dart), "setupFixture"));
+        assert!(!is_test_entry_name(Some(Language::Rust), "main"));
+        assert!(is_test_entry_name(Some(Language::Rust), "test_foo"));
     }
 }

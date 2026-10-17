@@ -1,37 +1,19 @@
 # Dart indexing
 
-Vex registers `.dart` as language ID 20 using
-[`tree-sitter-dart-orchard` 0.7.0](https://crates.io/crates/tree-sitter-dart-orchard/0.7.0).
-The exact pin is reproducible; it does not establish grammar superiority or full
-language coverage. The [crate manifest](https://codeberg.org/grammar-orchard/tree-sitter-dart-orchard)
-names Tim Whiting as author, and the [crates.io version record](https://crates.io/api/v1/crates/tree-sitter-dart-orchard/0.7.0)
-lists Antonin Delpeuch (`wetneb`) as publisher. Orchard release metadata names
-[`cfping/tree-sitter-dart`](https://github.com/cfping/tree-sitter-dart) as upstream.
-These sources do not establish Orchard's current maintainer, which remains
-unverified. Orchard exposes a `LanguageFn` compatible with this project's
-Tree-sitter 0.26 dependency; cfping's [current manifest](https://github.com/cfping/tree-sitter-dart/blob/master/Cargo.toml)
-uses Tree-sitter 0.25.3. This is a concrete API compatibility rationale for
-the published crate, not a comparative quality claim.
+Vex pins `tree-sitter-dart-orchard` 0.7.0 for `.dart` files. Indexing is
+offline and does not execute or require the Dart SDK.
 
-The index extracts classes, enums, mixins, named extensions, extension types,
-functions, methods, constructors, type aliases, enum constants, and import
-URIs. Calls are syntactic name edges; hierarchy edges preserve `extends`,
-`implements`, and mixin `with` relations. References use the shared
-`is_meaningful_identifier` filter and omit comments and plain string text while
-retaining identifiers in interpolation. Imports and references are not
-compiler-resolved.
+The extractor indexes classes, enums, mixins, extensions, extension types,
+functions, methods, constructors, type aliases, enum constants, and imports.
+Constructors use qualified identities such as `Repo.new` and `Repo.named`.
+Call edges are syntactic; hierarchy edges retain `extends`, `implements`, and
+`with` relations. References use the shared identifier filter and are not
+resolved by a compiler or across imported libraries.
 
-Fixtures cover selected declarations, calls, relations, aliases, imports,
-interpolation, and test-path classification. The [record syntax fixture](../tests/dart_query_test.rs)
-parses a record type, literal, and destructuring pattern without Tree-sitter
-errors. It does not verify all [record](https://dart.dev/language/records) or
-pattern forms. The fixtures do not establish complete Dart 3 compatibility.
-Orchard can recover from unsupported syntax with partial trees. Class modifiers,
-switch forms, and other modern syntax remain unverified without dedicated
-fixtures. Earlier parser comparisons observed recovery on valid constructs,
-including higher-order and null-asserted invocations. A successful parse or
-index does not prove complete syntax support.
+Fixtures cover selected declarations, constructors, calls, hierarchy
+relations, aliases, imports, interpolation, and test paths. They do not prove
+complete Dart 3 syntax coverage. Unsupported syntax may produce partial trees;
+records, patterns, class modifiers, and other modern forms remain incompletely
+verified. There is no strict compiler-backed Dart reference binder.
 
-Indexing is offline and does not execute or require the Dart SDK. No strict
-compiler-backed Dart references are provided. See
-[`SUPPORTED_LANGUAGES.md`](SUPPORTED_LANGUAGES.md) for the support matrix.
+See [Supported languages](SUPPORTED_LANGUAGES.md) for the support matrix.

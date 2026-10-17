@@ -1,6 +1,7 @@
 use super::language::Language;
 
 mod body;
+pub(crate) mod dart;
 mod refs;
 mod symbols;
 

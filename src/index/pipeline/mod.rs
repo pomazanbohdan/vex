@@ -238,6 +238,7 @@ fn try_skip_update(
     opts: IndexOptions,
     embedder_id: &str,
     root: &Path,
+    required_revision: u16,
 ) -> Result<Option<usize>> {
     if !manifest_options_cover(manifest, opts, embedder_id) {
         return Ok(None);
@@ -248,7 +249,7 @@ fn try_skip_update(
     }
     let reader = crate::store::reader::IndexReader::open(&index_path)
         .context("open existing index to check update skip eligibility")?;
-    if !parse_revision::is_current(&config::index_dir(root)) {
+    if !parse_revision::is_current(&config::index_dir(root), required_revision) {
         return Ok(None);
     }
     if reader.header().version < crate::store::format::VERSION {
@@ -337,6 +338,8 @@ fn run_with_lock(
     hashed: parse_files::HashedFiles,
     _lock: IndexLock,
 ) -> Result<(usize, bool)> {
+    let required_revision =
+        parse_revision::required_for_paths(hashed.hashes.iter().map(|(path, _)| path.as_str()));
     // Double-check under the lock: if a peer just completed a rebuild with an
     // identical file fingerprint AND the index file is actually on disk, skip
     // the redundant work. `vex index` is deterministic from its inputs (same
@@ -353,7 +356,7 @@ fn run_with_lock(
             let diff = manifest::diff_files(&hashed.hashes, &current_manifest);
             if diff.changed.is_empty()
                 && diff.deleted.is_empty()
-                && parse_revision::is_current(&config::index_dir(root))
+                && parse_revision::is_current(&config::index_dir(root), required_revision)
                 && run_can_skip(&current_manifest, opts, embedder_id)
             {
                 tracing::info!(
@@ -401,7 +404,9 @@ fn run_with_lock(
             None
         };
     let vector_dim = vector_dim_for(embedder_id, &vectors);
-    parse_revision::invalidate(&config::index_dir(root))?;
+    let index_dir = config::index_dir(root);
+    let saved_revision = parse_revision::preserve_known_revision(&index_dir, required_revision);
+    parse_revision::invalidate(&index_dir)?;
     write_output_locked(
         root,
         &all_parsed,
@@ -455,7 +460,7 @@ fn run_with_lock(
         );
     }
 
-    parse_revision::save(&config::index_dir(root))?;
+    parse_revision::save(&index_dir, saved_revision)?;
 
     tracing::info!(
         symbols = symbol_count,
@@ -588,6 +593,8 @@ fn update_inner(
     let cache = build_blob_cache();
     let blob_map = crate::index::parse_cache::git_blobs::discover_tracked_blobs(&root);
 
+    let required_revision =
+        parse_revision::required_for_paths(hashed.hashes.iter().map(|(path, _)| path.as_str()));
     let diff = manifest::diff_files(&hashed.hashes, &old_manifest);
 
     // v1.12.0: skip only if the on-disk index satisfies every option we were
@@ -595,7 +602,9 @@ fn update_inner(
     // structural-only index would early-return and silently leave the
     // embedder request unfulfilled.
     if diff.changed.is_empty() && diff.deleted.is_empty() {
-        if let Some(symbol_count) = try_skip_update(&old_manifest, opts, embedder_id, &root)? {
+        if let Some(symbol_count) =
+            try_skip_update(&old_manifest, opts, embedder_id, &root, required_revision)?
+        {
             tracing::info!(unchanged = diff.unchanged, "nothing to update");
             return Ok(Some((symbol_count, 0, 0)));
         }
@@ -633,13 +642,20 @@ fn update_inner(
     // migration can only reuse vectors for files whose bytes are unchanged.
     let content_changed_paths: HashSet<String> =
         diff.changed.iter().chain(&diff.deleted).cloned().collect();
-    if config::index_path(&root).exists() && !parse_revision::is_current(&config::index_dir(&root))
+    if config::index_path(&root).exists()
+        && !parse_revision::is_current(&config::index_dir(&root), required_revision)
     {
         diff.changed = hashed.hashes.iter().map(|(path, _)| path.clone()).collect();
         diff.unchanged = 0;
     }
     if diff.changed.is_empty() && diff.deleted.is_empty() {
-        if let Some(symbol_count) = try_skip_update(&current_manifest, opts, embedder_id, &root)? {
+        if let Some(symbol_count) = try_skip_update(
+            &current_manifest,
+            opts,
+            embedder_id,
+            &root,
+            required_revision,
+        )? {
             tracing::info!("index refreshed by a concurrent vex instance; skipping rebuild");
             return Ok(Some((symbol_count, 0, 0)));
         }
@@ -853,7 +869,9 @@ fn update_inner(
     ) = if index_path.exists() {
         let reader = crate::store::reader::IndexReader::open(&index_path)
             .context("open existing index for incremental merge")?;
-        if !parse_revision::is_current(&config::index_dir(&root)) && !opts.with_embeddings {
+        if !parse_revision::is_current(&config::index_dir(&root), required_revision)
+            && !opts.with_embeddings
+        {
             let changed: HashSet<&str> = content_changed_paths.iter().map(String::as_str).collect();
             migration_vectors = semantic_migration::collect_migration_vectors(
                 &reader,
@@ -1161,7 +1179,9 @@ fn update_inner(
         None
     };
     let vector_dim = vector_dim_for(semantic_embedder_id, &all_vectors);
-    parse_revision::invalidate(&config::index_dir(&root))?;
+    let index_dir = config::index_dir(&root);
+    let saved_revision = parse_revision::preserve_known_revision(&index_dir, required_revision);
+    parse_revision::invalidate(&index_dir)?;
     write_output_locked(
         &root,
         &all_parsed,
@@ -1216,7 +1236,7 @@ fn update_inner(
         }
     }
 
-    parse_revision::save(&config::index_dir(&root))?;
+    parse_revision::save(&index_dir, saved_revision)?;
 
     tracing::info!(
         total = symbol_count,

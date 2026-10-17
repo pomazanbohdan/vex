@@ -61,6 +61,14 @@ pub(crate) fn capture_hierarchy_edges(
         Some(i) => i,
         None => return Vec::new(),
     };
+    let relation_indices = [
+        (query.capture_index_for_name("relation.extends"), "extends"),
+        (
+            query.capture_index_for_name("relation.implements"),
+            "implements",
+        ),
+        (query.capture_index_for_name("relation.uses"), "uses"),
+    ];
 
     let source = content.as_bytes();
     let mut cursor = QueryCursor::new();
@@ -71,6 +79,7 @@ pub(crate) fn capture_hierarchy_edges(
         let mut parent_name = None;
         let mut child_name = None;
         let mut child_line: u32 = 0;
+        let mut relation = None;
 
         for capture in m.captures {
             if capture.index == base_idx {
@@ -85,11 +94,18 @@ pub(crate) fn capture_hierarchy_edges(
                     // tree) can't wrap rather than clamp.
                     child_line = (capture.node.start_position().row as u32).saturating_add(1);
                 }
+            } else if let Some((_, label)) = relation_indices
+                .iter()
+                .find(|(index, _)| *index == Some(capture.index))
+            {
+                relation = Some(*label);
             }
         }
 
         if let (Some(child_name), Some(parent_name)) = (child_name, parent_name) {
-            let kind = relation_to_edge_kind(relation_label(lang, m.pattern_index));
+            let kind = relation_to_edge_kind(
+                relation.unwrap_or_else(|| relation_label(lang, m.pattern_index)),
+            );
             captures.push(HierarchyCapture {
                 child_name,
                 parent_name,

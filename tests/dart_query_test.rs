@@ -1,5 +1,6 @@
 use vex::callgraph::extract_call_edges;
 use vex::index::symbols::SymbolKind;
+use vex::parse::extractor::extract_references_ast;
 use vex::parse::extractor::extract_symbols_and_imports;
 use vex::parse::language::Language;
 
@@ -60,7 +61,76 @@ fn dart_constructor_and_type_kinds_are_distinct() {
         .any(|s| s.name == "Repository" && s.kind == SymbolKind::Class));
     assert!(symbols
         .iter()
-        .any(|s| s.name == "Repository" && s.kind == SymbolKind::Method));
+        .any(|s| s.name == "Repository.new" && s.kind == SymbolKind::Method));
+}
+
+#[test]
+fn dart_constructor_names_refs_and_callers_use_qualified_identity() {
+    let source = "class Repo { Repo(); Repo.named(Object value); factory Repo.make() { return Repo.named(helper()); } void named() {} } class OtherRepo { factory OtherRepo.make() { return Repo.named(helper()); } } int helper() => 1; void run() { Repo(); Repo.named(helper()); new Repo.named(helper()); const Repo.named(helper()); value.named(); value.loadNamed(); }";
+    let parsed = vex::parse::parse_file("sample.dart", source, dart()).unwrap();
+    for name in ["Repo.new", "Repo.named", "Repo.make"] {
+        assert!(
+            parsed.symbols.iter().any(|s| s.name == name),
+            "missing qualified constructor {name}: {:?}",
+            parsed.symbols
+        );
+    }
+    assert!(
+        parsed.symbols.iter().any(|s| s.name == "named"),
+        "ordinary method keeps its bare name: {:?}",
+        parsed.symbols
+    );
+    let refs = extract_references_ast(source, dart()).unwrap();
+    assert!(refs.iter().any(|r| r.name == "Repo.new"), "{refs:?}");
+    assert!(refs.iter().any(|r| r.name == "Repo.named"), "{refs:?}");
+    assert_eq!(
+        refs.iter().filter(|r| r.name == "named").count(),
+        0,
+        "bare constructor suffixes do not enter the refs index: {refs:?}"
+    );
+    assert!(refs.iter().any(|r| r.name == "loadNamed"));
+    assert!(
+        parsed
+            .call_edges
+            .iter()
+            .any(|e| e.caller_fn_name == "Repo.make" && e.callee_name == "helper"),
+        "factory helper caller is qualified: {:?}",
+        parsed.call_edges
+    );
+    assert!(
+        parsed
+            .call_edges
+            .iter()
+            .any(|e| e.caller_fn_name == "OtherRepo.make" && e.callee_name == "Repo.named"),
+        "sibling factory caller is qualified: {:?}",
+        parsed.call_edges
+    );
+    assert!(
+        parsed
+            .call_edges
+            .iter()
+            .any(|e| e.caller_fn_name == "Repo.make" && e.callee_name == "Repo.named"),
+        "factory constructor call is qualified: {:?}",
+        parsed.call_edges
+    );
+    assert_eq!(
+        parsed
+            .call_edges
+            .iter()
+            .filter(|e| e.caller_fn_name == "Repo.make" && e.callee_name == "Repo.named")
+            .count(),
+        1,
+        "nested helper argument must not duplicate the constructor edge: {:?}",
+        parsed.call_edges
+    );
+    assert!(
+        parsed
+            .call_edges
+            .iter()
+            .any(|e| e.caller_fn_name == "Repo.make" && e.callee_name == "helper"),
+        "nested ordinary call keeps its own edge: {:?}",
+        parsed.call_edges
+    );
 }
 
 #[test]
@@ -102,7 +172,14 @@ fn dart_calls_exclude_bare_identifiers_and_comments() {
 fn dart_generic_and_conditional_calls() {
     let source = "void run(Client? client) { client?.fetch(); Future<void>.delayed(Duration.zero); List<int>.of([]); Box<int>(); new Crate<int>(); const Item<int>(); }";
     let edges = extract_call_edges(source, dart());
-    for name in ["fetch", "delayed", "of", "Box", "Crate", "Item"] {
+    for name in [
+        "fetch",
+        "Future.delayed",
+        "List.of",
+        "Box.new",
+        "Crate.new",
+        "Item.new",
+    ] {
         assert!(
             edges
                 .iter()
@@ -119,7 +196,7 @@ fn dart_initializer_calls_belong_to_constructor() {
     assert!(
         edges
             .iter()
-            .any(|(from, _, to, _)| from == "C" && to == "helper"),
+            .any(|(from, _, to, _)| from == "C.new" && to == "helper"),
         "constructor owner lost: {edges:?}"
     );
 }

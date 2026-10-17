@@ -376,7 +376,15 @@ fn extract_callgraph_with_tree(
         for capture in m.captures {
             let text = &content[capture.node.byte_range()];
             if capture.index == fn_name_idx {
-                fn_name = Some(text);
+                fn_name = Some(if lang == Language::Dart {
+                    crate::parse::extractor::dart::declaration_identity(
+                        capture.node,
+                        content.as_bytes(),
+                    )
+                    .unwrap_or_else(|| text.to_string())
+                } else {
+                    text.to_string()
+                });
                 fn_line = capture.node.start_position().row + 1;
             } else if capture.index == fn_body_idx {
                 fn_body_range = Some((capture.node.start_byte(), capture.node.end_byte()));
@@ -397,7 +405,15 @@ fn extract_callgraph_with_tree(
                 if has_sibling_host && call_capture_inside_sibling_host(capture.node, lang) {
                     continue;
                 }
-                call_name = Some(text);
+                call_name = Some(if lang == Language::Dart {
+                    crate::parse::extractor::dart::call_identity_for_capture(
+                        capture.node,
+                        content.as_bytes(),
+                    )
+                    .unwrap_or_else(|| text.to_string())
+                } else {
+                    text.to_string()
+                });
                 call_line = capture.node.start_position().row + 1;
                 call_offset = capture.node.start_byte();
             } else if Some(capture.index) == sibling_target_idx {
@@ -411,7 +427,7 @@ fn extract_callgraph_with_tree(
                 // sentinel (`<module:path>` caller). Bypasses the
                 // sibling-host filter intentionally — see capture's
                 // declaration above.
-                call_name = Some(text);
+                call_name = Some(text.to_string());
                 call_line = capture.node.start_position().row + 1;
                 call_offset = capture.node.start_byte();
             }

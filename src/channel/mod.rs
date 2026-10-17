@@ -315,7 +315,6 @@ pub fn build_def_sites<'a>(
     symbol: &str,
 ) -> HashMap<&'a str, HashSet<u32>> {
     let mut map: HashMap<&'a str, HashSet<u32>> = HashMap::new();
-    let full_dart_name = symbol.to_lowercase();
     let normalized_symbol = symbol.to_lowercase();
     if let Some(sym_fst) = reader.symbol_fst_reader() {
         for sym_idx in sym_fst.find(symbol) {
@@ -324,11 +323,6 @@ pub fn build_def_sites<'a>(
                     continue;
                 }
                 let file_path: &str = reader.read_string(sym.file_offset);
-                if file_path.ends_with(".dart")
-                    && reader.read_string(sym.name_offset).to_lowercase() != full_dart_name
-                {
-                    continue;
-                }
                 map.entry(file_path).or_default().insert(sym.line);
             }
         }
@@ -470,7 +464,7 @@ pub fn derive_verdict(invocations: &[ChannelInvocation]) -> (Verdict, String) {
 
 // ───────────────────────── Channel implementations ────────────────────────
 
-/// Persisted v5 `reference_edges` from native language binders.
+/// Phase 11.1 v5 `reference_edges` — binder-resolved cross-file refs.
 pub struct StrictRefsChannel;
 
 impl Channel for StrictRefsChannel {

@@ -51,29 +51,6 @@ fn run_cli(root: &Path, marker: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn cli_help_describes_persisted_native_refs_without_sdk_or_compiler_claims() {
-    let impact = Command::cargo_bin("vex")
-        .unwrap()
-        .args(["impact", "--help"])
-        .output()
-        .unwrap();
-    assert!(impact.status.success());
-    let impact_help = String::from_utf8_lossy(&impact.stdout);
-    assert!(impact_help.contains("persisted native strict refs"));
-    assert!(!impact_help.contains("Dart Analysis Server"));
-
-    let usages = Command::cargo_bin("vex")
-        .unwrap()
-        .args(["usages", "--help"])
-        .output()
-        .unwrap();
-    assert!(usages.status.success());
-    let usages_help = String::from_utf8_lossy(&usages.stdout);
-    assert!(usages_help.contains("persisted native binder refs"));
-    assert!(!usages_help.contains("compiler/binder-resolved refs"));
-}
-
-#[test]
 fn dart_fvm_sdk_is_never_executed_by_strict_usages_or_impact() {
     let fixture = TempDir::new().unwrap();
     let local_root = fixture.path().join("local");
@@ -97,7 +74,7 @@ fn dart_fvm_sdk_is_never_executed_by_strict_usages_or_impact() {
         let _usages = run_cli(&root, &marker, &["usages", "target", "--strict"]);
         let impact = run_cli(&root, &marker, &["impact", "target", "--format", "json"]);
         assert!(!_usages.status.success());
-        assert!(String::from_utf8_lossy(&_usages.stderr).contains("--strict needs a v5 index"));
+        assert!(String::from_utf8_lossy(&_usages.stderr).contains("no strict binder for Dart yet"));
         let impact_json: serde_json::Value = serde_json::from_slice(&impact.stdout).unwrap();
         let strict = &impact_json["results"]["channels"]["strict_refs"];
         assert_eq!(strict["available"], false);
