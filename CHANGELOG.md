@@ -10,6 +10,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - The public Rust library API `vex::search::semantic::search_with_embedder` is
   removed; downstream crates that import it must adapt before upgrading.
+
 ### Added
 
 - **Incremental parser-revision migration** retains semantic vectors only when model, dimension and exact context identity are validated. Files containing symbols with doc comments or Rust attributes are re-embedded.
