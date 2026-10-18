@@ -315,9 +315,13 @@ pub fn build_def_sites<'a>(
     symbol: &str,
 ) -> HashMap<&'a str, HashSet<u32>> {
     let mut map: HashMap<&'a str, HashSet<u32>> = HashMap::new();
+    let normalized_symbol = symbol.to_lowercase();
     if let Some(sym_fst) = reader.symbol_fst_reader() {
         for sym_idx in sym_fst.find(symbol) {
             if let Some(sym) = reader.symbol(sym_idx as usize) {
+                if reader.read_string(sym.name_offset).to_lowercase() != normalized_symbol {
+                    continue;
+                }
                 let file_path: &str = reader.read_string(sym.file_offset);
                 map.entry(file_path).or_default().insert(sym.line);
             }
