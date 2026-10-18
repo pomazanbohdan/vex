@@ -1,8 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use anyhow::{Context, Result};
-
 use crate::index::manifest::Manifest;
 use crate::index::symbols::{ParsedFile, ParsedSymbol, SymbolKind};
 use crate::store::reader::IndexReader;
@@ -90,13 +88,37 @@ pub(super) fn collect_migration_vectors(
     Some((id.to_string(), files))
 }
 
+fn transfer_matched_vectors(
+    retained_vectors: &mut Vec<Vec<f32>>,
+    vectors: &mut [Option<Vec<f32>>],
+    matched: &[usize],
+) -> bool {
+    let prefix_len = retained_vectors.len();
+    for &idx in matched {
+        let Some(vector) = vectors.get_mut(idx).and_then(Option::take) else {
+            retained_vectors.truncate(prefix_len);
+            return false;
+        };
+        retained_vectors.push(vector);
+    }
+    true
+}
+
 pub(super) fn reuse_migration_vectors(
     fresh_files: Vec<ParsedFile>,
     embedder_id: &str,
     mut old_files: HashMap<String, Vec<MigrationVector>>,
-) -> Result<MigratedFiles> {
-    let budget = crate::embed::embedder_char_budget(embedder_id)
-        .context("migration embedder has no known context budget")?;
+) -> MigratedFiles {
+    let Some(budget) = crate::embed::embedder_char_budget(embedder_id) else {
+        tracing::warn!(
+            embedder_id,
+            "declining semantic vector migration with unknown context budget"
+        );
+        return MigratedFiles {
+            files: fresh_files,
+            vectors: Vec::new(),
+        };
+    };
     let mut retained_files = Vec::new();
     let mut retained_vectors = Vec::new();
     let mut unembedded_files = Vec::new();
@@ -150,24 +172,21 @@ pub(super) fn reuse_migration_vectors(
                 .into_iter()
                 .map(|prior| Some(prior.vector))
                 .collect::<Vec<_>>();
-            for idx in matched {
-                retained_vectors.push(
-                    vectors
-                        .get_mut(idx)
-                        .and_then(Option::take)
-                        .context("migration match has no stored vector")?,
-                );
+            if transfer_matched_vectors(&mut retained_vectors, &mut vectors, &matched) {
+                retained_files.push(fresh);
+            } else {
+                tracing::warn!(file = %fresh.path, "declining semantic vector reuse with missing stored vector");
+                unembedded_files.push(fresh);
             }
-            retained_files.push(fresh);
         } else {
             unembedded_files.push(fresh);
         }
     }
     retained_files.extend(unembedded_files);
-    Ok(MigratedFiles {
+    MigratedFiles {
         files: retained_files,
         vectors: retained_vectors,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -263,7 +282,7 @@ mod tests {
             ),
         ]);
 
-        let migrated = reuse_migration_vectors(fresh_files, embedder, old_files).unwrap();
+        let migrated = reuse_migration_vectors(fresh_files, embedder, old_files);
 
         assert_eq!(
             migrated
@@ -281,5 +300,58 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1.0f32.to_bits(), (-0.0f32).to_bits()]
         );
+    }
+
+    #[test]
+    fn unknown_context_budget_declines_all_files_without_vectors() {
+        let fresh_files = vec![
+            file("first.rs", vec![symbol("first", "body")]),
+            file("second.rs", vec![symbol("second", "body")]),
+        ];
+        let old_files = HashMap::from([
+            (
+                "first.rs".to_string(),
+                vec![prior("first.rs", symbol("first", "body"), vec![0.0, 1.0])],
+            ),
+            (
+                "second.rs".to_string(),
+                vec![prior("second.rs", symbol("second", "body"), vec![1.0, 0.0])],
+            ),
+        ]);
+
+        let migrated = reuse_migration_vectors(fresh_files, "unknown-embedder", old_files);
+
+        assert_eq!(
+            migrated
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["first.rs", "second.rs"]
+        );
+        assert!(migrated.vectors.is_empty());
+    }
+
+    #[test]
+    fn missing_vector_rolls_back_partial_file_vectors() {
+        let mut retained_vectors = vec![vec![1.0, -0.0]];
+        let mut vectors = vec![Some(vec![0.0, 1.0]), None, Some(vec![1.0, 0.0])];
+
+        assert!(!transfer_matched_vectors(
+            &mut retained_vectors,
+            &mut vectors,
+            &[0, 1, 2]
+        ));
+
+        assert_eq!(
+            retained_vectors[0]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            [1.0f32.to_bits(), (-0.0f32).to_bits()]
+        );
+        assert_eq!(retained_vectors.len(), 1);
+        assert!(vectors[0].is_none());
+        assert!(vectors[2].is_some());
     }
 }

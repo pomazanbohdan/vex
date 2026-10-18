@@ -1114,7 +1114,7 @@ fn update_inner(
     let mut retained_embedder = None;
     if let Some((id, old_files)) = migration_vectors {
         artefacts.cluster_carry = None;
-        let migrated = semantic_migration::reuse_migration_vectors(all_parsed, &id, old_files)?;
+        let migrated = semantic_migration::reuse_migration_vectors(all_parsed, &id, old_files);
         all_parsed = migrated.files;
         all_vectors = migrated.vectors;
         unchanged_count = all_vectors.len();
