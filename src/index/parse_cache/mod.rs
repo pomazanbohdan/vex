@@ -124,7 +124,19 @@ const PAYLOAD_OFFSET: usize = HEADER_SIZE + 1 + BLOOM_SLOT;
 /// continues to be the canonical "serialize + write" entry point for tests
 /// and any future callers.
 pub(crate) fn encode_entry(lang: Language, pf: &ParsedFile) -> bincode::Result<Vec<u8>> {
-    let payload = bincode::serialize(pf)?;
+    encode_entry_with_dart_metadata(lang, pf, None)
+}
+
+pub(crate) fn encode_entry_with_dart_metadata(
+    lang: Language,
+    pf: &ParsedFile,
+    metadata: Option<&crate::index::dart_records::DartRecord>,
+) -> bincode::Result<Vec<u8>> {
+    let payload = if lang == Language::Dart {
+        bincode::serialize(&(pf, metadata))?
+    } else {
+        bincode::serialize(pf)?
+    };
     let fingerprint = cache_fingerprint_for_lang(lang);
     let mut buf = Vec::with_capacity(PAYLOAD_OFFSET + payload.len());
     buf.extend_from_slice(MAGIC);
@@ -168,6 +180,15 @@ impl BlobCache {
     /// failure (missing file, bad magic, wrong version, wrong fingerprint,
     /// decode error). Never deletes or modifies files.
     pub fn lookup(&self, sha: &str, lang: Language) -> Option<ParsedFile> {
+        self.lookup_with_dart_metadata(sha, lang)
+            .map(|(parsed, _)| parsed)
+    }
+
+    pub(crate) fn lookup_with_dart_metadata(
+        &self,
+        sha: &str,
+        lang: Language,
+    ) -> Option<(ParsedFile, Option<crate::index::dart_records::DartRecord>)> {
         let path = self.entry_path(sha);
         let data = fs::read(&path).ok()?;
 
@@ -208,9 +229,18 @@ impl BlobCache {
         };
 
         // Decode payload and re-attach the transient (serde-skipped) bloom.
-        let mut pf = bincode::deserialize::<ParsedFile>(&data[PAYLOAD_OFFSET..]).ok()?;
+        let (mut pf, metadata) = if lang == Language::Dart {
+            let (parsed, metadata): (ParsedFile, Option<crate::index::dart_records::DartRecord>) =
+                bincode::deserialize(&data[PAYLOAD_OFFSET..]).ok()?;
+            (parsed, metadata)
+        } else {
+            (
+                bincode::deserialize::<ParsedFile>(&data[PAYLOAD_OFFSET..]).ok()?,
+                None,
+            )
+        };
         pf.trigram_bloom = trigram_bloom;
-        Some(pf)
+        Some((pf, metadata))
     }
 
     /// Serialize `pf` and write it to the cache entry for `sha` / `lang`.
@@ -398,6 +428,57 @@ mod tests {
             trigram_bloom: None,
             hierarchy_captures: Vec::new(),
         }
+    }
+
+    #[test]
+    fn native_cache_payload_is_the_existing_parsed_file_encoding() {
+        let parsed = parsed_file();
+        let bytes = encode_entry(Language::Rust, &parsed).unwrap();
+        assert_eq!(
+            &bytes[PAYLOAD_OFFSET..],
+            &bincode::serialize(&parsed).unwrap()
+        );
+    }
+
+    #[test]
+    fn dart_cache_round_trips_raw_metadata() {
+        let dir = TempDir::new().unwrap();
+        let cache = BlobCache::new(dir.path().join("blobs"));
+        let sha = "dabcde0123456789abcdef0123456789abcdef01";
+        let mut parsed = parsed_file();
+        parsed.path = "lib/source.dart".into();
+        let metadata = crate::index::dart_records::DartRecord {
+            source_fingerprint: 17,
+            declarations: vec![crate::index::dart_records::DartDeclaration {
+                owner: "Owner".into(),
+                member: "member".into(),
+                kind: crate::index::dart_records::DartDeclarationKind::StaticMethod,
+            }],
+            raw_refs: vec![crate::index::symbols::ParsedRef {
+                name: "Owner.member".into(),
+                line: 8,
+                context: Some("Owner.member()".into()),
+            }],
+            raw_calls: vec![crate::index::symbols::RawCallEdge {
+                caller_fn_name: "caller".into(),
+                caller_fn_line: 4,
+                callee_name: "Owner.member".into(),
+                line: 8,
+            }],
+        };
+        let encoded =
+            encode_entry_with_dart_metadata(Language::Dart, &parsed, Some(&metadata)).unwrap();
+        cache.write_entry_bytes(sha, &encoded).unwrap();
+        assert_eq!(
+            cache
+                .lookup_with_dart_metadata(sha, Language::Dart)
+                .unwrap()
+                .1
+                .unwrap()
+                .raw_calls[0]
+                .callee_name,
+            "Owner.member"
+        );
     }
 
     #[test]

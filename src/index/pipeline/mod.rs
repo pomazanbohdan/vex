@@ -252,6 +252,11 @@ fn try_skip_update(
     if !parse_revision::is_current(&config::index_dir(root), required_revision) {
         return Ok(None);
     }
+    if required_revision == parse_revision::DART
+        && !crate::index::dart_records::covers_manifest(&index_path, &manifest.files)
+    {
+        return Ok(None);
+    }
     if reader.header().version < crate::store::format::VERSION {
         return Ok(None);
     }
@@ -357,6 +362,11 @@ fn run_with_lock(
             if diff.changed.is_empty()
                 && diff.deleted.is_empty()
                 && parse_revision::is_current(&config::index_dir(root), required_revision)
+                && (required_revision != parse_revision::DART
+                    || crate::index::dart_records::covers_manifest(
+                        &index_path,
+                        &current_manifest.files,
+                    ))
                 && run_can_skip(&current_manifest, opts, embedder_id)
             {
                 tracing::info!(
@@ -373,8 +383,9 @@ fn run_with_lock(
     let cache = build_blob_cache();
     let blob_map = crate::index::parse_cache::git_blobs::discover_tracked_blobs(root);
 
-    let mut all_parsed = parse_files(root, &files, &blob_map, &cache)?;
-    refresh_dart_derived_records(root, &mut all_parsed)?;
+    let (mut all_parsed, mut dart_metadata) = parse_files(root, &files, &blob_map, &cache)?;
+    let dart_records =
+        refresh_dart_derived_records(root, &mut all_parsed, &hashed.hashes, &mut dart_metadata)?;
     let symbol_count: usize = all_parsed.iter().map(|f| f.symbols.len()).sum();
 
     let (mut vectors, hashes) = if opts.with_embeddings && symbol_count > 0 {
@@ -419,6 +430,21 @@ fn run_with_lock(
         true, // is_full_rebuild — `vex index` always replaces everything
         &crate::index::types::IndexBuildArtefacts::default(),
     )?;
+    if required_revision == parse_revision::DART {
+        crate::index::dart_records::write_atomic(
+            &crate::index::dart_records::sidecar_path(&index_dir),
+            &dart_records,
+        )?;
+    } else if saved_revision == parse_revision::DART {
+        let sidecar = crate::index::dart_records::sidecar_path(&index_dir);
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("remove {}", sidecar.display()))
+            }
+        }
+    }
 
     if !vectors.is_empty() {
         build_hnsw(root, &vectors, &hashes)?;
@@ -646,8 +672,45 @@ fn update_inner(
     if config::index_path(&root).exists()
         && !parse_revision::is_current(&config::index_dir(&root), required_revision)
     {
-        diff.changed = hashed.hashes.iter().map(|(path, _)| path.clone()).collect();
-        diff.unchanged = 0;
+        if required_revision == parse_revision::DART {
+            for (path, _) in &hashed.hashes {
+                if std::path::Path::new(path)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .and_then(crate::parse::language::Language::from_extension)
+                    == Some(crate::parse::language::Language::Dart)
+                    && !diff.changed.contains(path)
+                {
+                    diff.changed.push(path.clone());
+                }
+            }
+            diff.changed.sort();
+            diff.unchanged = hashed.hashes.len().saturating_sub(diff.changed.len());
+        } else {
+            diff.changed = hashed.hashes.iter().map(|(path, _)| path.clone()).collect();
+            diff.unchanged = 0;
+        }
+    }
+    if required_revision == parse_revision::DART
+        && config::index_path(&root).exists()
+        && !crate::index::dart_records::covers_manifest(
+            &config::index_path(&root),
+            &current_manifest.files,
+        )
+    {
+        for (path, _) in &hashed.hashes {
+            if std::path::Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .and_then(crate::parse::language::Language::from_extension)
+                == Some(crate::parse::language::Language::Dart)
+                && !diff.changed.contains(path)
+            {
+                diff.changed.push(path.clone());
+            }
+        }
+        diff.changed.sort();
+        diff.unchanged = hashed.hashes.len().saturating_sub(diff.changed.len());
     }
     if diff.changed.is_empty() && diff.deleted.is_empty() {
         if let Some(symbol_count) = try_skip_update(
@@ -1051,7 +1114,7 @@ fn update_inner(
         .cloned()
         .collect();
 
-    let newly_parsed = parse_files(&root, &changed_paths, &blob_map, &cache)?;
+    let (newly_parsed, mut dart_metadata) = parse_files(&root, &changed_paths, &blob_map, &cache)?;
     let new_sym_count: usize = newly_parsed.iter().map(|f| f.symbols.len()).sum();
 
     // P4b (`docs/V9-FORMAT.md` §13 R11) — pad the carry Vecs out to the
@@ -1180,7 +1243,15 @@ fn update_inner(
         None
     };
     let vector_dim = vector_dim_for(semantic_embedder_id, &all_vectors);
-    refresh_dart_derived_records(&root, &mut all_parsed)?;
+    let dart_records =
+        refresh_dart_derived_records(&root, &mut all_parsed, &hashed.hashes, &mut dart_metadata)?;
+    let had_dart_records = current_manifest.files.iter().any(|(path, _)| {
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(crate::parse::language::Language::from_extension)
+            == Some(crate::parse::language::Language::Dart)
+    });
     let index_dir = config::index_dir(&root);
     let saved_revision = parse_revision::preserve_known_revision(&index_dir, required_revision);
     parse_revision::invalidate(&index_dir)?;
@@ -1195,6 +1266,21 @@ fn update_inner(
         false, // is_full_rebuild — incremental update, skeletons partial
         &artefacts,
     )?;
+    if required_revision == parse_revision::DART {
+        crate::index::dart_records::write_atomic(
+            &crate::index::dart_records::sidecar_path(&index_dir),
+            &dart_records,
+        )?;
+    } else if had_dart_records {
+        let sidecar = crate::index::dart_records::sidecar_path(&index_dir);
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("remove {}", sidecar.display()))
+            }
+        }
+    }
 
     if !all_vectors.is_empty() && all_vectors.len() == symbol_count {
         let all_hashes = compute_hashes_for(&all_parsed, semantic_embedder_id)?;

@@ -28,7 +28,7 @@ pub use refs::extract_references_ast;
 // Shared-tree core behind `extract_references_ast`, called by `parse_file`
 // with the tree it already parsed. `pub(crate)` on purpose: no consumer
 // outside the crate, and it would put `tree_sitter::Tree` in the public API.
-pub(crate) use refs::extract_references_ast_with_tree;
+pub(crate) use refs::extract_references_ast_with_tree_and_raw;
 
 /// Sentinel error type for grammar / query compilation failures.
 ///

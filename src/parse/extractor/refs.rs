@@ -83,11 +83,20 @@ pub(crate) fn extract_references_ast_with_tree(
     content: &str,
     lang: Language,
 ) -> Vec<ParsedRef> {
+    extract_references_ast_with_tree_and_raw(tree, content, lang).0
+}
+
+pub(crate) fn extract_references_ast_with_tree_and_raw(
+    tree: &tree_sitter::Tree,
+    content: &str,
+    lang: Language,
+) -> (Vec<ParsedRef>, Vec<ParsedRef>) {
     if !lang.has_ast_ref_filter() {
-        return extract_references(content);
+        return (extract_references(content), Vec::new());
     }
 
     let mut refs = Vec::new();
+    let mut dart_raw_refs = Vec::new();
     // v1.12.0 P4 — collect line slices once, then pass an O(1)-indexable
     // view to the recursive walker. The old code did
     // `content.lines().nth(n)` per identifier node; on identifier-dense
@@ -105,8 +114,9 @@ pub(crate) fn extract_references_ast_with_tree(
         lang,
         &dart_facts,
         &mut refs,
+        &mut dart_raw_refs,
     );
-    refs
+    (refs, dart_raw_refs)
 }
 
 fn walk_for_refs(
@@ -116,6 +126,7 @@ fn walk_for_refs(
     lang: Language,
     dart_facts: &super::dart::ProjectFacts,
     refs: &mut Vec<ParsedRef>,
+    dart_raw_refs: &mut Vec<ParsedRef>,
 ) {
     let kind = node.kind();
 
@@ -129,13 +140,20 @@ fn walk_for_refs(
             if is_meaningful_identifier(owner_name) {
                 let unnamed_constructor = qualified_name == owner_name;
                 if !unnamed_constructor {
-                    refs.push(ParsedRef {
+                    let owner_ref = ParsedRef {
                         name: owner_name.to_string(),
                         line,
                         context: context.clone(),
-                    });
+                    };
+                    refs.push(owner_ref.clone());
+                    dart_raw_refs.push(owner_ref);
                 }
                 let normalized_name = dart_facts.normalize_ref(&qualified_name);
+                dart_raw_refs.push(ParsedRef {
+                    name: qualified_name.clone(),
+                    line,
+                    context: context.clone(),
+                });
                 if is_meaningful_identifier(&normalized_name) {
                     refs.push(ParsedRef {
                         name: normalized_name,
@@ -149,9 +167,17 @@ fn walk_for_refs(
                 let function = node.child_by_field_name("function");
                 for child in node.children(&mut cursor) {
                     if function.is_some_and(|function| function.id() == child.id()) {
-                        walk_type_arguments(child, content, lines, lang, dart_facts, refs);
+                        walk_type_arguments(
+                            child,
+                            content,
+                            lines,
+                            lang,
+                            dart_facts,
+                            refs,
+                            dart_raw_refs,
+                        );
                     } else {
-                        walk_for_refs(child, content, lines, lang, dart_facts, refs);
+                        walk_for_refs(child, content, lines, lang, dart_facts, refs, dart_raw_refs);
                     }
                 }
             } else {
@@ -159,7 +185,7 @@ fn walk_for_refs(
                     if !contains_node(child, owner)
                         && suffix.is_none_or(|suffix| !contains_node(child, suffix))
                     {
-                        walk_for_refs(child, content, lines, lang, dart_facts, refs);
+                        walk_for_refs(child, content, lines, lang, dart_facts, refs, dart_raw_refs);
                     }
                 }
             }
@@ -186,7 +212,7 @@ fn walk_for_refs(
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child.kind() == interp_kind {
-                walk_for_refs(child, content, lines, lang, dart_facts, refs);
+                walk_for_refs(child, content, lines, lang, dart_facts, refs, dart_raw_refs);
             }
         }
         return;
@@ -206,15 +232,22 @@ fn walk_for_refs(
             refs.push(ParsedRef {
                 name: text.to_string(),
                 line,
-                context,
+                context: context.clone(),
             });
+            if lang == Language::Dart {
+                dart_raw_refs.push(ParsedRef {
+                    name: text.to_string(),
+                    line,
+                    context,
+                });
+            }
         }
         return;
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_for_refs(child, content, lines, lang, dart_facts, refs);
+        walk_for_refs(child, content, lines, lang, dart_facts, refs, dart_raw_refs);
     }
 }
 
@@ -229,14 +262,15 @@ fn walk_type_arguments(
     lang: Language,
     dart_facts: &super::dart::ProjectFacts,
     refs: &mut Vec<ParsedRef>,
+    dart_raw_refs: &mut Vec<ParsedRef>,
 ) {
     if node.kind() == "type_arguments" {
-        walk_for_refs(node, content, lines, lang, dart_facts, refs);
+        walk_for_refs(node, content, lines, lang, dart_facts, refs, dart_raw_refs);
         return;
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_type_arguments(child, content, lines, lang, dart_facts, refs);
+        walk_type_arguments(child, content, lines, lang, dart_facts, refs, dart_raw_refs);
     }
 }
 

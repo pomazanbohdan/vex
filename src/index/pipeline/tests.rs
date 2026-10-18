@@ -640,6 +640,146 @@ fn dart_revision_one_migrates_once_then_unchanged_update_skips() {
     );
 }
 
+#[test]
+fn index_and_update_repair_missing_partial_corrupt_and_stale_dart_sidecars() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("sample.dart"), "class Repo { Repo(); }\n").unwrap();
+    let opts = IndexOptions {
+        with_embeddings: false,
+        with_clusters: false,
+        with_pattern_index: false,
+        ..IndexOptions::default()
+    };
+    super::run(&root, opts, "minilm-l6-v2", &[]).unwrap();
+    let index_dir = config::index_dir(&root);
+    let sidecar = crate::index::dart_records::sidecar_path(&index_dir);
+    for full_index in [false, true] {
+        for corruption in 0..4 {
+            match corruption {
+                0 => std::fs::remove_file(&sidecar).unwrap(),
+                1 => std::fs::write(&sidecar, b"VXDR").unwrap(),
+                2 => {
+                    let mut partial = crate::index::dart_records::DartRecords::new();
+                    let mut records = crate::index::dart_records::decode(&sidecar).unwrap();
+                    records.remove("sample.dart");
+                    partial.append(&mut records);
+                    crate::index::dart_records::write_atomic(&sidecar, &partial).unwrap();
+                }
+                _ => {
+                    let mut records = crate::index::dart_records::decode(&sidecar).unwrap();
+                    records.get_mut("sample.dart").unwrap().source_fingerprint ^= 1;
+                    crate::index::dart_records::write_atomic(&sidecar, &records).unwrap();
+                }
+            }
+            if full_index {
+                let (_, rebuilt) = super::run(&root, opts, "minilm-l6-v2", &[]).unwrap();
+                assert!(rebuilt, "invalid sidecar must trigger Dart rebuild");
+            } else {
+                let (_, changed, deleted) =
+                    super::update(&root, opts, "minilm-l6-v2", &[]).unwrap();
+                assert_eq!(
+                    (changed, deleted),
+                    (1, 0),
+                    "invalid sidecar must trigger Dart reparse"
+                );
+            }
+            let manifest = Manifest::load(&config::manifest_path(&root)).unwrap();
+            assert!(crate::index::dart_records::covers_manifest(
+                &config::index_path(&root),
+                &manifest.files
+            ));
+            assert!(parse_revision::is_current(&index_dir, parse_revision::DART));
+            assert_eq!(
+                crate::index::dart_records::decode(&sidecar).unwrap()["sample.dart"]
+                    .source_fingerprint,
+                manifest.files["sample.dart"]
+            );
+        }
+    }
+    let before_noop = std::fs::read(config::index_path(&root)).unwrap();
+    let (_, changed, deleted) = super::update(&root, opts, "minilm-l6-v2", &[]).unwrap();
+    assert_eq!((changed, deleted), (0, 0));
+    assert_eq!(
+        std::fs::read(config::index_path(&root)).unwrap(),
+        before_noop
+    );
+}
+
+#[test]
+fn dart_rename_and_last_file_deletion_remove_stale_sidecar_records() {
+    use crate::store::reader::IndexReader;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("sample.dart"),
+        "class Repo { Repo(); static void run() {} }\nvoid invoke() { Repo.run(); }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("native.rs"), "pub fn native() {}\n").unwrap();
+    let opts = IndexOptions {
+        with_embeddings: false,
+        with_clusters: false,
+        with_pattern_index: false,
+        ..IndexOptions::default()
+    };
+    super::run(&root, opts, "minilm-l6-v2", &[]).unwrap();
+    let index_dir = config::index_dir(&root);
+    let sidecar = crate::index::dart_records::sidecar_path(&index_dir);
+
+    let raw_sidecar_before_native_update = std::fs::read(&sidecar).unwrap();
+    std::fs::write(
+        root.join("native.rs"),
+        "pub fn native() {}\npub fn changed() {}\n",
+    )
+    .unwrap();
+    super::update(&root, opts, "minilm-l6-v2", &[]).unwrap();
+    assert_eq!(
+        std::fs::read(&sidecar).unwrap(),
+        raw_sidecar_before_native_update,
+        "native-only update must preserve unchanged Dart raw metadata"
+    );
+    {
+        let reader = IndexReader::open(&config::index_path(&root)).unwrap();
+        assert!(
+            !reader.ref_reader().unwrap().find("Repo").is_empty(),
+            "Dart refs survive native update"
+        );
+        assert!(
+            reader.call_edge_count() > 0,
+            "Dart calls survive native update"
+        );
+    }
+
+    std::fs::rename(root.join("sample.dart"), root.join("renamed.dart")).unwrap();
+    super::update(&root, opts, "minilm-l6-v2", &[]).unwrap();
+    let records = crate::index::dart_records::decode(&sidecar).unwrap();
+    assert!(!records.contains_key("sample.dart"));
+    assert!(records.contains_key("renamed.dart"));
+    {
+        let reader = IndexReader::open(&config::index_path(&root)).unwrap();
+        assert!(!reader.file_paths().iter().any(|path| path == "sample.dart"));
+        assert!(reader
+            .file_paths()
+            .iter()
+            .any(|path| path == "renamed.dart"));
+        assert!(reader.file_paths().iter().any(|path| path == "native.rs"));
+    }
+
+    std::fs::remove_file(root.join("renamed.dart")).unwrap();
+    std::fs::write(
+        root.join("native.rs"),
+        "pub fn native() {}\npub fn changed() {}\n",
+    )
+    .unwrap();
+    super::update(&root, opts, "minilm-l6-v2", &[]).unwrap();
+    assert!(!sidecar.exists());
+    let reader = IndexReader::open(&config::index_path(&root)).unwrap();
+    assert_eq!(reader.file_paths(), vec!["native.rs".to_string()]);
+    assert_eq!(reader.symbol_count(), 2);
+}
+
 type FixtureVectorKey = (String, String, crate::index::symbols::SymbolKind, usize);
 
 fn seed_fixture_vectors(

@@ -29,6 +29,7 @@ pub use extractor::extract_call_edges;
 // tree it already parsed. `pub(crate)`: no external consumer, and exporting it
 // would put `tree_sitter::Tree` in the public API.
 pub(crate) use extractor::extract_call_edges_with_tree;
+pub(crate) use extractor::extract_call_edges_with_tree_raw;
 use extractor::{callees_in_source_with_facts, callers_in_source_with_facts};
 use queries::callgraph_query;
 

@@ -4,8 +4,8 @@ use crate::parse::NodeTextExt;
 
 #[derive(Default, Clone)]
 pub(crate) struct ProjectFacts {
-    static_methods: std::collections::HashSet<String>,
-    named_constructors: std::collections::HashSet<String>,
+    static_methods: std::collections::BTreeSet<String>,
+    named_constructors: std::collections::BTreeSet<String>,
 }
 
 impl ProjectFacts {
@@ -44,6 +44,51 @@ impl ProjectFacts {
     pub(crate) fn merge(&mut self, other: Self) {
         self.static_methods.extend(other.static_methods);
         self.named_constructors.extend(other.named_constructors);
+    }
+
+    pub(crate) fn from_declarations(
+        declarations: &[crate::index::dart_records::DartDeclaration],
+    ) -> Self {
+        let mut facts = Self::default();
+        for declaration in declarations {
+            let name = format!("{}.{}", declaration.owner, declaration.member);
+            match declaration.kind {
+                crate::index::dart_records::DartDeclarationKind::StaticMethod => {
+                    facts.static_methods.insert(name);
+                }
+                crate::index::dart_records::DartDeclarationKind::NamedConstructor => {
+                    facts.named_constructors.insert(name);
+                }
+            }
+        }
+        facts
+    }
+
+    pub(crate) fn declarations(&self) -> Vec<crate::index::dart_records::DartDeclaration> {
+        let mut declarations =
+            Vec::with_capacity(self.static_methods.len() + self.named_constructors.len());
+        for name in &self.static_methods {
+            if let Some((owner, member)) = name.rsplit_once('.') {
+                declarations.push(crate::index::dart_records::DartDeclaration {
+                    owner: owner.to_owned(),
+                    member: member.to_owned(),
+                    kind: crate::index::dart_records::DartDeclarationKind::StaticMethod,
+                });
+            }
+        }
+        for name in &self.named_constructors {
+            if let Some((owner, member)) = name.rsplit_once('.') {
+                declarations.push(crate::index::dart_records::DartDeclaration {
+                    owner: owner.to_owned(),
+                    member: member.to_owned(),
+                    kind: crate::index::dart_records::DartDeclarationKind::NamedConstructor,
+                });
+            }
+        }
+        declarations.sort_by(|a, b| {
+            (&a.owner, &a.member, a.kind as u8).cmp(&(&b.owner, &b.member, b.kind as u8))
+        });
+        declarations
     }
 
     pub(crate) fn normalize_call(&self, name: &str) -> String {

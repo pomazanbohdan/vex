@@ -200,7 +200,25 @@ pub(crate) fn extract_call_edges_with_tree(
     content: &str,
     lang: Language,
 ) -> Vec<(String, usize, String, usize)> {
-    let Some((fns, calls)) = extract_callgraph_with_tree(tree, content, lang) else {
+    extract_call_edges_with_tree_mode(tree, content, lang, true)
+}
+
+pub(crate) fn extract_call_edges_with_tree_raw(
+    tree: &tree_sitter::Tree,
+    content: &str,
+    lang: Language,
+) -> Vec<(String, usize, String, usize)> {
+    extract_call_edges_with_tree_mode(tree, content, lang, false)
+}
+
+fn extract_call_edges_with_tree_mode(
+    tree: &tree_sitter::Tree,
+    content: &str,
+    lang: Language,
+    normalize_dart: bool,
+) -> Vec<(String, usize, String, usize)> {
+    let Some((fns, calls)) = extract_callgraph_with_tree(tree, content, lang, normalize_dart)
+    else {
         return Vec::new();
     };
     edges_from(fns, calls)
@@ -311,7 +329,7 @@ fn extract_callgraph(content: &str, lang: Language) -> Option<(Vec<FnDef>, Vec<C
     // v1.12.0 P3 — pooled per-thread parser; v1.23.0 — guarded by the
     // shared `parse_text` budget.
     let tree = crate::parse::parser_pool::parse_text(lang, content).ok()?;
-    extract_callgraph_with_tree(&tree, content, lang)
+    extract_callgraph_with_tree(&tree, content, lang, true)
 }
 
 /// [`extract_callgraph`] over a tree the caller already parsed.
@@ -319,6 +337,7 @@ fn extract_callgraph_with_tree(
     tree: &tree_sitter::Tree,
     content: &str,
     lang: Language,
+    normalize_dart: bool,
 ) -> Option<(Vec<FnDef>, Vec<Call>)> {
     let query = compiled_query(lang)?;
     let dart_facts = (lang == Language::Dart)
@@ -428,10 +447,14 @@ fn extract_callgraph_with_tree(
                             )
                         })
                         .unwrap_or_else(|| text.to_string());
-                    dart_facts
-                        .as_ref()
-                        .map(|facts| facts.normalize_call(&raw))
-                        .unwrap_or(raw)
+                    if normalize_dart {
+                        dart_facts
+                            .as_ref()
+                            .map(|facts| facts.normalize_call(&raw))
+                            .unwrap_or(raw)
+                    } else {
+                        raw
+                    }
                 } else {
                     text.to_string()
                 });
