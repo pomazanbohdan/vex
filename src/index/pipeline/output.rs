@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use crate::embed;
 use crate::index::manifest::Manifest;
 use crate::index::symbols::ParsedFile;
+use crate::parse::extractor::dart::ProjectFacts;
 use crate::parse::language::Language;
 use crate::store;
 use crate::util::config;
@@ -175,6 +176,69 @@ pub(super) fn resolve_call_edges(
         }
     }
     out
+}
+
+pub(super) fn refresh_dart_derived_records(root: &Path, parsed: &mut [ParsedFile]) -> Result<()> {
+    if !parsed.iter().any(|file| {
+        Path::new(&file.path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(Language::from_extension)
+            == Some(Language::Dart)
+    }) {
+        return Ok(());
+    }
+
+    let mut raw_dart = Vec::new();
+    let mut facts = ProjectFacts::default();
+    for (index, file) in parsed.iter().enumerate() {
+        let Some(Language::Dart) = Path::new(&file.path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(Language::from_extension)
+        else {
+            continue;
+        };
+        let source_path = root.join(&file.path);
+        let source = std::fs::read_to_string(&source_path).with_context(|| {
+            format!(
+                "read Dart source {} for project resolution",
+                source_path.display()
+            )
+        })?;
+        facts.merge(ProjectFacts::from_source(&source).with_context(|| {
+            format!(
+                "collect Dart declaration facts from {}",
+                source_path.display()
+            )
+        })?);
+        let fresh =
+            crate::parse::parse_file(&file.path, &source, Language::Dart).with_context(|| {
+                format!(
+                    "refresh raw Dart refs and calls from {}",
+                    source_path.display()
+                )
+            })?;
+        raw_dart.push((index, fresh.refs, fresh.call_edges));
+    }
+
+    for (index, refs, call_edges) in raw_dart {
+        parsed[index].refs = refs
+            .into_iter()
+            .map(|mut reference| {
+                reference.name = facts.normalize_ref(&reference.name);
+                reference
+            })
+            .collect();
+        parsed[index].call_edges = call_edges
+            .into_iter()
+            .map(|mut edge| {
+                edge.callee_name = facts.normalize_call(&edge.callee_name);
+                edge
+            })
+            .collect();
+    }
+    Ok(())
 }
 
 /// Output of [`collect_pattern_skeletons`] — the flattened skeleton tuples

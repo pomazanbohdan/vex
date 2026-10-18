@@ -93,14 +93,17 @@ pub(crate) fn extract_references_ast_with_tree(
     // `content.lines().nth(n)` per identifier node; on identifier-dense
     // files that compounded to O(line_count × ident_count).
     let line_slices: Vec<&str> = content.lines().collect();
-    let dart_context = (lang == Language::Dart)
-        .then(|| super::dart::DeclarationContext::from_tree(tree, content.as_bytes()));
+    let dart_facts = if lang == Language::Dart {
+        super::dart::ProjectFacts::from_tree(tree, content.as_bytes())
+    } else {
+        super::dart::ProjectFacts::default()
+    };
     walk_for_refs(
         tree.root_node(),
         content,
         &line_slices,
         lang,
-        dart_context.as_ref(),
+        &dart_facts,
         &mut refs,
     );
     refs
@@ -111,27 +114,31 @@ fn walk_for_refs(
     content: &str,
     lines: &[&str],
     lang: Language,
-    dart_context: Option<&super::dart::DeclarationContext>,
+    dart_facts: &super::dart::ProjectFacts,
     refs: &mut Vec<ParsedRef>,
 ) {
     let kind = node.kind();
 
     if lang == Language::Dart {
-        if let Some((owner, suffix, qualified_name)) = dart_context
-            .and_then(|context| super::dart::call_identity(node, content.as_bytes(), context))
+        if let Some((owner, suffix, qualified_name)) =
+            super::dart::call_identity(node, content.as_bytes(), dart_facts)
         {
             let line = owner.start_position().row + 1;
             let context = lines.get(line - 1).map(|l| l.trim().to_string());
             let owner_name = owner.node_text(content.as_bytes());
             if is_meaningful_identifier(owner_name) {
-                refs.push(ParsedRef {
-                    name: owner_name.to_string(),
-                    line,
-                    context: context.clone(),
-                });
-                if is_meaningful_identifier(&qualified_name) {
+                let unnamed_constructor = qualified_name == owner_name;
+                if !unnamed_constructor {
                     refs.push(ParsedRef {
-                        name: qualified_name,
+                        name: owner_name.to_string(),
+                        line,
+                        context: context.clone(),
+                    });
+                }
+                let normalized_name = dart_facts.normalize_ref(&qualified_name);
+                if is_meaningful_identifier(&normalized_name) {
+                    refs.push(ParsedRef {
+                        name: normalized_name,
                         line,
                         context: context.clone(),
                     });
@@ -142,9 +149,9 @@ fn walk_for_refs(
                 let function = node.child_by_field_name("function");
                 for child in node.children(&mut cursor) {
                     if function.is_some_and(|function| function.id() == child.id()) {
-                        walk_type_arguments(child, content, lines, lang, dart_context, refs);
+                        walk_type_arguments(child, content, lines, lang, dart_facts, refs);
                     } else {
-                        walk_for_refs(child, content, lines, lang, dart_context, refs);
+                        walk_for_refs(child, content, lines, lang, dart_facts, refs);
                     }
                 }
             } else {
@@ -152,7 +159,7 @@ fn walk_for_refs(
                     if !contains_node(child, owner)
                         && suffix.is_none_or(|suffix| !contains_node(child, suffix))
                     {
-                        walk_for_refs(child, content, lines, lang, dart_context, refs);
+                        walk_for_refs(child, content, lines, lang, dart_facts, refs);
                     }
                 }
             }
@@ -179,7 +186,7 @@ fn walk_for_refs(
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child.kind() == interp_kind {
-                walk_for_refs(child, content, lines, lang, dart_context, refs);
+                walk_for_refs(child, content, lines, lang, dart_facts, refs);
             }
         }
         return;
@@ -207,7 +214,7 @@ fn walk_for_refs(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_for_refs(child, content, lines, lang, dart_context, refs);
+        walk_for_refs(child, content, lines, lang, dart_facts, refs);
     }
 }
 
@@ -220,16 +227,16 @@ fn walk_type_arguments(
     content: &str,
     lines: &[&str],
     lang: Language,
-    dart_context: Option<&super::dart::DeclarationContext>,
+    dart_facts: &super::dart::ProjectFacts,
     refs: &mut Vec<ParsedRef>,
 ) {
     if node.kind() == "type_arguments" {
-        walk_for_refs(node, content, lines, lang, dart_context, refs);
+        walk_for_refs(node, content, lines, lang, dart_facts, refs);
         return;
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_type_arguments(child, content, lines, lang, dart_context, refs);
+        walk_type_arguments(child, content, lines, lang, dart_facts, refs);
     }
 }
 

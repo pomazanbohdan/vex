@@ -63,11 +63,11 @@ fn dart_constructor_collision_preserves_transitive_subtypes() {
         assert!(parsed
             .symbols
             .iter()
-            .any(|s| s.name == format!("{name}.new") && s.kind == SymbolKind::Method));
+            .any(|s| s.name == name && s.kind == SymbolKind::Method));
         assert!(parsed
             .call_edges
             .iter()
-            .any(|edge| edge.callee_name == format!("{name}.new")));
+            .any(|edge| edge.callee_name == name));
     }
 }
 
@@ -185,10 +185,8 @@ fn dart_refs_apply_shared_filter_to_other_language_keywords() {
         ast_base_names, regex_names,
         "ordinary AST refs and the shared regex oracle diverged"
     );
-    assert_eq!(
-        qualified_names,
-        ["Repo.loadNamed".to_string(), "Repository.new".to_string()].into()
-    );
+    assert_eq!(qualified_names, ["Repo.loadNamed".to_string()].into());
+    assert!(ast_names.contains("Repository"));
     assert!(!ast_names.contains("Ok.new"));
     assert!(!ast_names.contains("C.new"));
 

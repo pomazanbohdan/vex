@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::parse::language::Language;
@@ -640,7 +640,12 @@ fn dart_revision_one_migrates_once_then_unchanged_update_skips() {
     );
 }
 
-fn seed_fixture_vectors(root: &std::path::Path, embedder_id: &str) -> HashMap<String, Vec<u32>> {
+type FixtureVectorKey = (String, String, crate::index::symbols::SymbolKind, usize);
+
+fn seed_fixture_vectors(
+    root: &std::path::Path,
+    embedder_id: &str,
+) -> HashMap<FixtureVectorKey, Vec<u32>> {
     use crate::embed::{build_context, cache::context_hash, embedder_char_budget, embedder_dim};
     use crate::index::manifest::Manifest;
     use crate::index::symbols::ParsedFile;
@@ -680,9 +685,12 @@ fn seed_fixture_vectors(root: &std::path::Path, embedder_id: &str) -> HashMap<St
         hashes.push(context_hash(embedder_id, &context));
         let mut vector: Vec<f32> = vec![0.0; dimension];
         vector[index] = 1.0;
-        expected.insert(
-            symbol.name.clone(),
-            vector.iter().map(|v| v.to_bits()).collect(),
+        let key = (path.clone(), symbol.name.clone(), symbol.kind, symbol.line);
+        assert!(
+            expected
+                .insert(key.clone(), vector.iter().map(|v| v.to_bits()).collect())
+                .is_none(),
+            "fixture vector identity must be unique: {key:?}"
         );
         vectors.push(vector);
         let file_index = *file_indices.entry(path.clone()).or_insert_with(|| {
@@ -711,22 +719,35 @@ fn seed_fixture_vectors(root: &std::path::Path, embedder_id: &str) -> HashMap<St
     expected
 }
 
-fn assert_fixture_vectors(root: &std::path::Path, expected: &HashMap<String, Vec<u32>>) {
+fn assert_fixture_vectors(root: &std::path::Path, expected: &HashMap<FixtureVectorKey, Vec<u32>>) {
     let reader = crate::store::reader::IndexReader::open(&config::index_path(root)).unwrap();
+    let mut observed = HashSet::new();
     for index in 0..reader.symbol_count() {
         let record = reader.symbol(index).unwrap();
+        let path = reader.read_string(record.file_offset).to_string();
         let name = reader.read_string(record.name_offset);
-        let Some(want) = expected.get(name) else {
+        let kind = crate::index::symbols::SymbolKind::try_from(record.kind).unwrap();
+        let key = (path, name.to_string(), kind, record.line as usize);
+        let Some(want) = expected.get(&key) else {
             continue;
         };
+        assert!(
+            observed.insert(key.clone()),
+            "duplicate retained vector identity: {key:?}"
+        );
         let got = reader
             .vector(record.vector_index)
             .unwrap()
             .iter()
             .map(|v| v.to_bits())
             .collect::<Vec<_>>();
-        assert_eq!(got, *want, "stored vector bits changed for {name}");
+        assert_eq!(got, *want, "stored vector bits changed for {key:?}");
     }
+    assert_eq!(
+        observed,
+        expected.keys().cloned().collect(),
+        "not all seeded vectors were retained"
+    );
 }
 
 #[test]

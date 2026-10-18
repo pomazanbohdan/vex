@@ -28,7 +28,7 @@
     {
       "doc": null,
       "line": 12,
-      "name": "Service.new"
+      "name": "Service"
     },
     {
       "doc": null,
@@ -73,7 +73,7 @@
         "line": 18
       },
       {
-        "callee_name": "Service.new",
+        "callee_name": "Service",
         "caller_fn_line": 23,
         "caller_fn_name": "run",
         "line": 24
@@ -143,11 +143,6 @@
         "context": "final service = Service();",
         "line": 24,
         "name": "Service"
-      },
-      {
-        "context": "final service = Service();",
-        "line": 24,
-        "name": "Service.new"
       },
       {
         "context": "import 'dart:async';",
@@ -261,7 +256,7 @@
         "body_tokens": "Service",
         "kind": "Method",
         "line": 12,
-        "name": "Service.new",
+        "name": "Service",
         "signature": "Service();"
       },
       {

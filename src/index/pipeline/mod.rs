@@ -15,7 +15,7 @@ mod semantic_migration;
 use lock::IndexLock;
 use output::{
     build_hnsw, build_hnsw_incremental, compute_hashes_for, generate_embeddings, prune_embed_cache,
-    vector_dim_for, write_output_locked,
+    refresh_dart_derived_records, vector_dim_for, write_output_locked,
 };
 
 // v1.15.0 B1.2 — bench / test / fuzz reach into the real `build_hnsw_at`
@@ -373,7 +373,8 @@ fn run_with_lock(
     let cache = build_blob_cache();
     let blob_map = crate::index::parse_cache::git_blobs::discover_tracked_blobs(root);
 
-    let all_parsed = parse_files(root, &files, &blob_map, &cache)?;
+    let mut all_parsed = parse_files(root, &files, &blob_map, &cache)?;
+    refresh_dart_derived_records(root, &mut all_parsed)?;
     let symbol_count: usize = all_parsed.iter().map(|f| f.symbols.len()).sum();
 
     let (mut vectors, hashes) = if opts.with_embeddings && symbol_count > 0 {
@@ -1179,6 +1180,7 @@ fn update_inner(
         None
     };
     let vector_dim = vector_dim_for(semantic_embedder_id, &all_vectors);
+    refresh_dart_derived_records(&root, &mut all_parsed)?;
     let index_dir = config::index_dir(&root);
     let saved_revision = parse_revision::preserve_known_revision(&index_dir, required_revision);
     parse_revision::invalidate(&index_dir)?;

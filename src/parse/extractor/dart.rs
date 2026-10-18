@@ -2,36 +2,71 @@ use tree_sitter::Node;
 
 use crate::parse::NodeTextExt;
 
-#[derive(Default)]
-pub(crate) struct DeclarationContext {
-    classes: std::collections::HashSet<String>,
-    top_level_functions: std::collections::HashSet<String>,
+#[derive(Default, Clone)]
+pub(crate) struct ProjectFacts {
+    static_methods: std::collections::HashSet<String>,
+    named_constructors: std::collections::HashSet<String>,
 }
 
-impl DeclarationContext {
+impl ProjectFacts {
+    pub(crate) fn from_source(source: &str) -> anyhow::Result<Self> {
+        let tree =
+            crate::parse::parser_pool::parse_text(crate::parse::language::Language::Dart, source)?;
+        Ok(Self::from_tree(&tree, source.as_bytes()))
+    }
+
     pub(crate) fn from_tree(tree: &tree_sitter::Tree, source: &[u8]) -> Self {
-        let mut context = Self::default();
+        let mut facts = Self::default();
         let mut pending = vec![tree.root_node()];
         while let Some(node) = pending.pop() {
-            if node.kind() == "function_declaration" {
-                if let Some(name) = node
-                    .child_by_field_name("signature")
-                    .and_then(|signature| signature.child_by_field_name("name"))
-                {
-                    context
-                        .top_level_functions
-                        .insert(name.node_text(source).to_string());
+            match node.kind() {
+                "method_declaration" => {
+                    if let Some(name) = static_method_identity(node, source) {
+                        facts.static_methods.insert(name);
+                    }
                 }
-            }
-            if node.kind() == "class_definition" {
-                if let Some(name) = node.child_by_field_name("name") {
-                    context.classes.insert(name.node_text(source).to_string());
+                kind if is_constructor_signature(kind) => {
+                    let identifiers = direct_identifiers(node);
+                    if identifiers.len() > 1 {
+                        let owner = identifiers[0].node_text(source);
+                        let name = identifiers[1].node_text(source);
+                        facts.named_constructors.insert(format!("{owner}.{name}"));
+                    }
                 }
+                _ => {}
             }
             let mut cursor = node.walk();
             pending.extend(node.named_children(&mut cursor));
         }
-        context
+        facts
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.static_methods.extend(other.static_methods);
+        self.named_constructors.extend(other.named_constructors);
+    }
+
+    pub(crate) fn normalize_call(&self, name: &str) -> String {
+        if let Some((owner, member)) = name.rsplit_once('.') {
+            if member == "new" {
+                return owner.to_owned();
+            }
+            if self.named_constructors.contains(name) {
+                return name.to_owned();
+            }
+            if self.static_methods.contains(name) {
+                return member.to_owned();
+            }
+        }
+        name.to_owned()
+    }
+
+    pub(crate) fn normalize_ref(&self, name: &str) -> String {
+        self.normalize_call(name)
+    }
+
+    fn has_known_member(&self, name: &str) -> bool {
+        self.named_constructors.contains(name) || self.static_methods.contains(name)
     }
 }
 
@@ -66,9 +101,8 @@ pub(crate) fn declaration_identity(node: Node<'_>, source: &[u8]) -> Option<Stri
         {
             return None;
         }
-        let owner = enclosing_class(method)?;
-        let class_name = owner.child_by_field_name("name")?.node_text(source);
-        return Some(format!("{class_name}.{}", node.node_text(source)));
+        enclosing_class(method)?;
+        return Some(node.node_text(source).to_owned());
     }
     let identifiers = direct_identifiers(signature);
     if !identifiers.iter().take(2).any(|id| id.id() == node.id()) {
@@ -76,6 +110,9 @@ pub(crate) fn declaration_identity(node: Node<'_>, source: &[u8]) -> Option<Stri
     }
     let owner = identifiers[0].node_text(source);
     let name = identifiers.get(1).map_or("new", |n| n.node_text(source));
+    if name == "new" {
+        return (!owner.is_empty()).then(|| owner.to_owned());
+    }
     (!owner.is_empty() && !name.is_empty()).then(|| format!("{owner}.{name}"))
 }
 
@@ -98,7 +135,7 @@ pub(crate) fn is_constructor_declaration_identifier(node: Node<'_>) -> bool {
 pub(crate) fn call_identity<'tree>(
     node: Node<'tree>,
     source: &[u8],
-    context: &DeclarationContext,
+    facts: &ProjectFacts,
 ) -> Option<(Node<'tree>, Option<Node<'tree>>, String)> {
     match node.kind() {
         "constructor_invocation" | "new_expression" | "const_object_expression" => {
@@ -115,8 +152,12 @@ pub(crate) fn call_identity<'tree>(
             let owner = owner?;
             let owner_name = owner.node_text(source);
             let name = suffix.map_or("new", |n| n.node_text(source));
-            (!owner_name.is_empty() && !name.is_empty())
-                .then(|| (owner, suffix, format!("{owner_name}.{name}")))
+            let identity = if name == "new" {
+                owner_name.to_owned()
+            } else {
+                format!("{owner_name}.{name}")
+            };
+            (!owner_name.is_empty() && !name.is_empty()).then_some((owner, suffix, identity))
         }
         "method_invocation" => {
             let function = node.child_by_field_name("function")?;
@@ -136,49 +177,54 @@ pub(crate) fn call_identity<'tree>(
             let owner_name = owner.node_text(source);
             let suffix = identifiers.get(1).copied();
             let member = suffix.map(|n| n.node_text(source));
-            let has_type_arguments =
-                node.child_by_field_name("arguments")
-                    .is_some_and(|arguments| {
-                        let mut cursor = arguments.walk();
-                        let has_type_arguments = arguments
-                            .named_children(&mut cursor)
-                            .any(|child| child.kind() == "type_arguments");
-                        has_type_arguments
-                    });
-            let name = match member {
+            let identity = match member {
                 Some(member)
-                    if context.classes.contains(owner_name)
-                        || owner_name.chars().next()?.is_uppercase() =>
+                    if owner_name.chars().next()?.is_uppercase()
+                        || facts.has_known_member(&format!("{owner_name}.{member}")) =>
                 {
-                    member
+                    format!("{owner_name}.{member}")
                 }
-                None if (context.classes.contains(owner_name)
-                    || (has_type_arguments
-                        && owner_name.chars().next().is_some_and(char::is_uppercase)))
-                    && !context.top_level_functions.contains(owner_name) =>
-                {
-                    "new"
+                None if owner_name.chars().next().is_some_and(char::is_uppercase) => {
+                    owner_name.to_owned()
                 }
                 _ => return None,
             };
-            (!owner_name.is_empty() && !name.is_empty())
-                .then(|| (owner, suffix, format!("{owner_name}.{name}")))
+            (!owner_name.is_empty() && !identity.is_empty()).then_some((owner, suffix, identity))
         }
         _ => None,
     }
 }
 
+fn static_method_identity(method: Node<'_>, source: &[u8]) -> Option<String> {
+    let signature = method.child_by_field_name("signature")?;
+    let mut signature_cursor = signature.walk();
+    let function_signature = signature
+        .named_children(&mut signature_cursor)
+        .find(|child| child.kind() == "function_signature")?;
+    let name = function_signature.child_by_field_name("name")?;
+    let mut cursor = signature.walk();
+    let is_static = signature
+        .children(&mut cursor)
+        .any(|child| child.kind() == "static");
+    if !is_static {
+        return None;
+    }
+    let owner = enclosing_class(method)?;
+    let class_name = owner.child_by_field_name("name")?.node_text(source);
+    Some(format!("{class_name}.{}", name.node_text(source)))
+}
+
 pub(crate) fn call_identity_for_capture(
     node: Node<'_>,
     source: &[u8],
-    context: &DeclarationContext,
+    facts: &ProjectFacts,
 ) -> Option<String> {
     let mut current = node;
     while let Some(parent) = current.parent() {
         if is_invocation(parent.kind()) {
-            return call_identity(parent, source, context).map(|(_, _, name)| name);
+            return call_identity(parent, source, facts).map(|(_, _, name)| name);
         }
-        if let Some((_, _, name)) = call_identity(parent, source, context) {
+        if let Some((_, _, name)) = call_identity(parent, source, facts) {
             return Some(name);
         }
         if matches!(

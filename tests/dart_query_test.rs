@@ -1,8 +1,107 @@
+use assert_cmd::Command;
+use std::path::Path;
+use tempfile::TempDir;
 use vex::callgraph::extract_call_edges;
 use vex::index::symbols::SymbolKind;
 use vex::parse::extractor::extract_references_ast;
 use vex::parse::extractor::extract_symbols_and_imports;
 use vex::parse::language::Language;
+
+fn vex_in(dir: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("vex").unwrap();
+    cmd.current_dir(dir);
+    cmd.env("VEX_CACHE_DIR", dir.join(".vex-test-cache"));
+    cmd
+}
+
+fn dart_identity_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join(".vex.toml"), "local_cache = true\n").unwrap();
+    std::fs::write(
+        tmp.path().join("a.dart"),
+        "class Foo { Foo(); Foo.named(); }\nclass Util { static int computeTotal(int x) => x; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("b.dart"),
+        "int Bar<T>(T value) => value;\nvoid run() {\n  Foo();\n  Util.computeTotal(3);\n  Foo.named();\n  new Foo.named();\n  Bar<int>(1);\n  fetch<int>();\n}\n",
+    )
+    .unwrap();
+    tmp
+}
+
+fn query_json(dir: &Path, command: &str, name: &str) -> serde_json::Value {
+    let output = vex_in(dir)
+        .args([command, name, "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).expect("query stdout is JSON")
+}
+
+fn query_json_allow_empty(dir: &Path, command: &str, name: &str) -> serde_json::Value {
+    let output = vex_in(dir)
+        .args([command, name, "--format", "json"])
+        .output()
+        .unwrap();
+    serde_json::from_slice(&output.stdout).expect("query stdout is JSON")
+}
+
+fn result_names(json: &serde_json::Value) -> Vec<String> {
+    json["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn assert_dart_callgraph_queries(dir: &Path, expected_named_calls: usize) {
+    for name in ["Foo", "computeTotal", "Foo.named"] {
+        let callers = result_names(&query_json(dir, "callers", name));
+        assert!(
+            callers.iter().any(|caller| caller == "run"),
+            "callers({name}) = {callers:?}"
+        );
+    }
+
+    let callees = result_names(&query_json(dir, "callees", "run"));
+    for name in ["Foo", "computeTotal", "Foo.named", "Bar", "fetch"] {
+        assert!(
+            callees.iter().any(|callee| callee == name),
+            "callees(run) missing {name}: {callees:?}"
+        );
+    }
+    for unexpected in ["Foo.new", "Util.computeTotal", "Bar.new", "fetch.new"] {
+        assert!(
+            !callees.iter().any(|callee| callee == unexpected),
+            "callees(run) has {unexpected}: {callees:?}"
+        );
+    }
+    let named_calls = callees
+        .iter()
+        .filter(|callee| callee.as_str() == "Foo.named")
+        .count();
+    assert_eq!(
+        named_calls, expected_named_calls,
+        "named constructor call projection differs by query mode: {callees:?}"
+    );
+}
+
+fn assert_dart_usage_queries(dir: &Path) {
+    let usages = query_json(dir, "usages", "Foo.named");
+    let usage_rows = usages["results"].as_array().unwrap();
+    assert_eq!(usage_rows.len(), 2, "usages(Foo.named) = {usage_rows:?}");
+    assert!(usage_rows.iter().all(|row| row["path"] == "b.dart"));
+
+    assert_eq!(
+        query_json(dir, "usages", "computeTotal")["results"],
+        serde_json::json!([{"path":"b.dart","line":4}]),
+        "static method usages use the bare name"
+    );
+}
 
 fn dart() -> Language {
     Language::from_extension("dart").expect(".dart must be registered")
@@ -53,7 +152,7 @@ fn dart_symbols_and_imports() {
 }
 
 #[test]
-fn dart_constructor_and_type_kinds_are_distinct() {
+fn dart_unnamed_constructor_and_type_kinds_are_distinct() {
     let (symbols, _) =
         extract_symbols_and_imports("class Repository { Repository(); }", dart()).unwrap();
     assert!(symbols
@@ -61,14 +160,14 @@ fn dart_constructor_and_type_kinds_are_distinct() {
         .any(|s| s.name == "Repository" && s.kind == SymbolKind::Class));
     assert!(symbols
         .iter()
-        .any(|s| s.name == "Repository.new" && s.kind == SymbolKind::Method));
+        .any(|s| s.name == "Repository" && s.kind == SymbolKind::Method));
 }
 
 #[test]
-fn dart_constructor_names_refs_and_callers_use_qualified_identity() {
+fn dart_constructor_names_refs_and_callers_use_declared_identity() {
     let source = "class Repo { Repo(); Repo.named(Object value); factory Repo.make() { return Repo.named(helper()); } void named() {} } class OtherRepo { factory OtherRepo.make() { return Repo.named(helper()); } } int helper() => 1; void run() { Repo(); Repo.named(helper()); new Repo.named(helper()); const Repo.named(helper()); value.named(); value.loadNamed(); }";
     let parsed = vex::parse::parse_file("sample.dart", source, dart()).unwrap();
-    for name in ["Repo.new", "Repo.named", "Repo.make"] {
+    for name in ["Repo", "Repo.named", "Repo.make"] {
         assert!(
             parsed.symbols.iter().any(|s| s.name == name),
             "missing qualified constructor {name}: {:?}",
@@ -81,7 +180,7 @@ fn dart_constructor_names_refs_and_callers_use_qualified_identity() {
         parsed.symbols
     );
     let refs = extract_references_ast(source, dart()).unwrap();
-    assert!(refs.iter().any(|r| r.name == "Repo.new"), "{refs:?}");
+    assert!(refs.iter().any(|r| r.name == "Repo"), "{refs:?}");
     assert!(refs.iter().any(|r| r.name == "Repo.named"), "{refs:?}");
     assert_eq!(
         refs.iter().filter(|r| r.name == "named").count(),
@@ -172,14 +271,7 @@ fn dart_calls_exclude_bare_identifiers_and_comments() {
 fn dart_generic_and_conditional_calls() {
     let source = "void run(Client? client) { client?.fetch(); Future<void>.delayed(Duration.zero); List<int>.of([]); Box<int>(); new Crate<int>(); const Item<int>(); }";
     let edges = extract_call_edges(source, dart());
-    for name in [
-        "fetch",
-        "Future.delayed",
-        "List.of",
-        "Box.new",
-        "Crate.new",
-        "Item.new",
-    ] {
+    for name in ["fetch", "Future.delayed", "List.of", "Box", "Crate", "Item"] {
         assert!(
             edges
                 .iter()
@@ -196,7 +288,7 @@ fn dart_initializer_calls_belong_to_constructor() {
     assert!(
         edges
             .iter()
-            .any(|(from, _, to, _)| from == "C.new" && to == "helper"),
+            .any(|(from, _, to, _)| from == "C" && to == "helper"),
         "constructor owner lost: {edges:?}"
     );
 }
@@ -285,29 +377,29 @@ fn dart_ast_refs_keep_interpolation_and_drop_literal_text() {
 }
 
 #[test]
-fn dart_static_method_calls_keep_qualified_identity_and_owner() {
+fn dart_static_method_calls_use_bare_identity_and_keep_owner() {
     let source = "int helper() => 1; class Util { static int computeTotal() => helper(); } void invoke() { Util.computeTotal(); }";
     let parsed = vex::parse::parse_file("sample.dart", source, dart()).unwrap();
 
     assert!(
-        parsed.symbols.iter().any(|s| s.name == "Util.computeTotal"),
-        "static method keeps its qualified symbol identity: {:?}",
+        parsed.symbols.iter().any(|s| s.name == "computeTotal"),
+        "static method uses its bare symbol identity: {:?}",
         parsed.symbols
     );
     assert!(
         parsed
             .call_edges
             .iter()
-            .any(|e| e.caller_fn_name == "Util.computeTotal" && e.callee_name == "helper"),
-        "helper call belongs to the qualified static method: {:?}",
+            .any(|e| e.caller_fn_name == "computeTotal" && e.callee_name == "helper"),
+        "helper call belongs to the bare static method: {:?}",
         parsed.call_edges
     );
     assert!(
         parsed
             .call_edges
             .iter()
-            .any(|e| e.caller_fn_name == "invoke" && e.callee_name == "Util.computeTotal"),
-        "static method call uses qualified callee identity: {:?}",
+            .any(|e| e.caller_fn_name == "invoke" && e.callee_name == "computeTotal"),
+        "static method call uses bare callee identity: {:?}",
         parsed.call_edges
     );
 }
@@ -342,7 +434,7 @@ fn dart_constructor_and_instance_method_identities_are_preserved_together() {
     let source = "int helper() => 1; class Owner { Owner(); Owner.named(); int foo() => helper(); } void invoke(Owner value) { Owner(); Owner.named(); value.foo(); }";
     let parsed = vex::parse::parse_file("sample.dart", source, dart()).unwrap();
 
-    for name in ["Owner.new", "Owner.named"] {
+    for name in ["Owner", "Owner.named"] {
         assert!(
             parsed.symbols.iter().any(|s| s.name == name),
             "missing qualified constructor {name}: {:?}",
@@ -373,6 +465,51 @@ fn dart_constructor_and_instance_method_identities_are_preserved_together() {
 }
 
 #[test]
+fn dart_lowercase_local_constructor_keeps_qualified_identity() {
+    let source = "class service_box { service_box(); service_box.named(); static int computeTotal() => 1; int ordinaryCall() => 2; } void invoke(service_box targetValue) { service_box.named(); service_box.computeTotal(); targetValue.ordinaryCall(); }";
+    let parsed = vex::parse::parse_file("sample.dart", source, dart()).unwrap();
+    let refs = extract_references_ast(source, dart()).unwrap();
+
+    assert!(
+        refs.iter().any(|r| r.name == "service_box.named"),
+        "known lowercase constructor ref keeps its qualified identity: {refs:?}"
+    );
+    for name in ["computeTotal", "ordinaryCall"] {
+        assert!(
+            refs.iter().any(|r| r.name == name),
+            "member ref uses bare identity {name}: {refs:?}"
+        );
+        assert!(
+            parsed
+                .call_edges
+                .iter()
+                .any(|e| e.caller_fn_name == "invoke" && e.callee_name == name),
+            "member call uses bare identity {name}: {:?}",
+            parsed.call_edges
+        );
+    }
+    for name in ["service_box.computeTotal", "targetValue.ordinaryCall"] {
+        assert!(
+            !refs.iter().any(|r| r.name == name),
+            "member ref must not retain owner qualification {name}: {refs:?}"
+        );
+        assert!(
+            !parsed.call_edges.iter().any(|e| e.callee_name == name),
+            "member call must not retain owner qualification {name}: {:?}",
+            parsed.call_edges
+        );
+    }
+    assert!(
+        parsed
+            .call_edges
+            .iter()
+            .any(|e| e.caller_fn_name == "invoke" && e.callee_name == "service_box.named"),
+        "known lowercase constructor call keeps qualified identity: {:?}",
+        parsed.call_edges
+    );
+}
+
+#[test]
 fn dart_unresolved_generic_function_call_stays_bare() {
     let edges = extract_call_edges("void invoke() { fetch<int>(); }", dart());
     assert!(
@@ -382,4 +519,142 @@ fn dart_unresolved_generic_function_call_stays_bare() {
         "generic function call must not become a constructor: {edges:?}"
     );
     assert!(!edges.iter().any(|(_, _, to, _)| to == "fetch.new"));
+}
+
+#[test]
+fn dart_cross_file_names_match_in_indexed_and_live_queries() {
+    let indexed = dart_identity_fixture();
+    vex_in(indexed.path())
+        .args([
+            "index",
+            "--no-semantic",
+            "--no-clusters",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success();
+    assert_dart_callgraph_queries(indexed.path(), 2);
+    assert_dart_usage_queries(indexed.path());
+
+    let live = dart_identity_fixture();
+    let index_path = live.path().join(".vex-test-cache/index.vex");
+    assert!(
+        !index_path.exists(),
+        "live fixture must start without an index"
+    );
+    assert_dart_callgraph_queries(live.path(), 1);
+    assert!(
+        !index_path.exists(),
+        "live callgraph queries must not bootstrap an index"
+    );
+}
+
+fn assert_cross_file_uppercase_function_names(dir: &Path) {
+    let callers_foo = result_names(&query_json(dir, "callers", "Foo"));
+    assert_eq!(callers_foo, ["run"]);
+
+    let callers_mystery = result_names(&query_json(dir, "callers", "Mystery"));
+    assert_eq!(callers_mystery, ["run"]);
+
+    let callees = result_names(&query_json(dir, "callees", "run"));
+    for name in ["Foo", "Mystery"] {
+        assert_eq!(
+            callees
+                .iter()
+                .filter(|callee| callee.as_str() == name)
+                .count(),
+            1,
+            "expected one bare {name} callee: {callees:?}"
+        );
+    }
+    for unexpected in ["Foo.new", "Mystery.new"] {
+        assert!(
+            !callees.iter().any(|callee| callee == unexpected),
+            "unexpected qualified no-member call {unexpected}: {callees:?}"
+        );
+    }
+}
+
+#[test]
+fn dart_uppercase_no_member_calls_are_bare_across_files() {
+    let make_fixture = || {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".vex.toml"), "local_cache = true\n").unwrap();
+        std::fs::write(tmp.path().join("a.dart"), "int Foo() => 1;\n").unwrap();
+        std::fs::write(
+            tmp.path().join("b.dart"),
+            "void run() { Foo(); Mystery<int>(); }\n",
+        )
+        .unwrap();
+        tmp
+    };
+
+    let indexed = make_fixture();
+    vex_in(indexed.path())
+        .args([
+            "index",
+            "--no-semantic",
+            "--no-clusters",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success();
+    assert_cross_file_uppercase_function_names(indexed.path());
+
+    let live = make_fixture();
+    let index_path = live.path().join(".vex-test-cache/index.vex");
+    assert!(
+        !index_path.exists(),
+        "live fixture must start without an index"
+    );
+    assert_cross_file_uppercase_function_names(live.path());
+    assert!(
+        !index_path.exists(),
+        "live queries must not bootstrap an index"
+    );
+}
+
+#[test]
+fn dart_incremental_rebind_uses_unchanged_callsite_source() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join(".vex.toml"), "local_cache = true\n").unwrap();
+    std::fs::write(
+        tmp.path().join("a.dart"),
+        "class Foo { static int named() => 1; }\n",
+    )
+    .unwrap();
+    let callsite = "void run() { Foo.named(); }\n";
+    std::fs::write(tmp.path().join("b.dart"), callsite).unwrap();
+    vex_in(tmp.path())
+        .args([
+            "index",
+            "--no-semantic",
+            "--no-clusters",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success();
+
+    let static_callers = result_names(&query_json(tmp.path(), "callers", "named"));
+    assert!(static_callers.iter().any(|caller| caller == "run"));
+    let constructor_callers =
+        result_names(&query_json_allow_empty(tmp.path(), "callers", "Foo.named"));
+    assert!(!constructor_callers.iter().any(|caller| caller == "run"));
+
+    std::fs::write(tmp.path().join("a.dart"), "class Foo { Foo.named(); }\n").unwrap();
+    vex_in(tmp.path())
+        .args(["update", "--no-semantic", "--format", "json"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("b.dart")).unwrap(),
+        callsite
+    );
+    let constructor_callers = result_names(&query_json(tmp.path(), "callers", "Foo.named"));
+    assert!(constructor_callers.iter().any(|caller| caller == "run"));
+    let static_callers = result_names(&query_json_allow_empty(tmp.path(), "callers", "named"));
+    assert!(!static_callers.iter().any(|caller| caller == "run"));
 }
