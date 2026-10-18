@@ -20,7 +20,9 @@ use anyhow::Result;
 use rayon::prelude::*;
 
 use crate::index::hasher;
-use crate::index::symbols::{HierarchyCapture, ParsedFile, ParsedSymbol, RawCallEdge, SymbolKind};
+use crate::index::symbols::{
+    HierarchyCapture, ParsedFile, ParsedRef, ParsedSymbol, RawCallEdge, SymbolKind,
+};
 use crate::index::types::{ReconstructedRef, ReconstructedUnresolvedRef};
 use crate::parse;
 use crate::parse::language::Language;
@@ -35,6 +37,10 @@ use super::CHUNK_SIZE;
 pub(super) struct ReconstructionResult {
     pub parsed_files: Vec<ParsedFile>,
     pub vectors: Vec<Vec<f32>>,
+    /// Output symbol ordinal paired with each reconstructed vector.
+    pub vector_source_symbols: Vec<usize>,
+    /// False when the old vector map could not be proved safe to carry.
+    pub vector_mapping_valid: bool,
     pub reconstructed_refs: Vec<ReconstructedRef>,
     /// Old-index file_paths table, kept so the writer can resolve
     /// `ReconstructedRef.from_file_id` → path → new file_id.
@@ -55,6 +61,8 @@ pub(super) struct ReconstructionResult {
     /// same order) — lets the writer grow `old_to_new` for this prefix
     /// without a second pass.
     pub cluster_old_sym_idx: Vec<u32>,
+    /// False when a cluster sidecar could not be permuted as a full symbol-aligned slice.
+    pub cluster_carry_valid: bool,
     /// P4b code-review follow-up (perf HIGH) — every OLD symbol whose
     /// path is in `changed` (re-parsed this update), captured in THIS
     /// loop instead of a second full scan over `reader.symbol_count()`
@@ -68,7 +76,7 @@ pub(super) struct ReconstructionResult {
 }
 
 /// Reconstruct ParsedFile + vectors for unchanged files from the existing index.
-/// Symbols are in index order (file-contiguous), vectors align 1:1 with symbols.
+/// Symbols are in index order (file-contiguous); stored vectors align to a valid leading symbol prefix.
 ///
 /// `body_tokens_sidecar` carries per-sym_idx body_tokens loaded from
 /// `index.bodytokens` (v1.15.0 B1.2):
@@ -110,6 +118,12 @@ pub(super) fn reconstruct_unchanged(
     }
     let has_vectors = reader.has_vectors();
     let mut vectors: Vec<Vec<f32>> = Vec::new();
+    let mut vector_source_symbols: Vec<usize> = Vec::new();
+    let mut vector_mapping_valid = true;
+    // Stored vectors must map to the leading symbol prefix in original index order.
+    let mut vector_coverage_ended = false;
+    let mut next_vector_index = 0usize;
+    let mut next_reconstructed_symbol = 0usize;
     let mut parsed_files: Vec<ParsedFile> = Vec::new();
     let mut current_path = String::new();
     let mut current_symbols: Vec<ParsedSymbol> = Vec::new();
@@ -129,7 +143,29 @@ pub(super) fn reconstruct_unchanged(
     for i in 0..reader.symbol_count() {
         let rec = match reader.symbol(i) {
             Some(r) => r,
-            None => continue,
+            None => {
+                vector_mapping_valid = false;
+                continue;
+            }
+        };
+        let stored_vector = if rec.vector_index == u32::MAX {
+            vector_coverage_ended = true;
+            None
+        } else if vector_coverage_ended || rec.vector_index as usize != next_vector_index {
+            vector_mapping_valid = false;
+            None
+        } else {
+            match next_vector_index.checked_add(1) {
+                Some(next) => next_vector_index = next,
+                None => vector_mapping_valid = false,
+            }
+            match reader.vector(rec.vector_index) {
+                Some(vector) => Some(vector),
+                None => {
+                    vector_mapping_valid = false;
+                    None
+                }
+            }
         };
         // Borrowed, not allocated yet — `deleted`/`changed` are
         // `HashSet<&str>`, so membership can be checked against this
@@ -197,6 +233,9 @@ pub(super) fn reconstruct_unchanged(
         // Persisting an empty-name record here would effectively delete
         // the symbol on the next rebuild and silently shrink the index.
         if name.is_empty() {
+            if stored_vector.is_some() {
+                vector_mapping_valid = false;
+            }
             tracing::warn!(
                 file = %current_path,
                 line = rec.line,
@@ -229,6 +268,14 @@ pub(super) fn reconstruct_unchanged(
             doc: None,
             body_tokens,
         });
+        if let Some(vector) = stored_vector {
+            vectors.push(vector.to_vec());
+            vector_source_symbols.push(next_reconstructed_symbol);
+        }
+        match next_reconstructed_symbol.checked_add(1) {
+            Some(next) => next_reconstructed_symbol = next,
+            None => vector_mapping_valid = false,
+        }
         // P4b (§13 R11) — pushed in lockstep with `current_symbols`,
         // right above, so a dropped empty-name record (the `continue`
         // above) can never desync this Vec from the symbols it carries
@@ -236,12 +283,6 @@ pub(super) fn reconstruct_unchanged(
         if let Some(cr) = cluster_reader {
             cluster_carried.push(cr.status(i as u32).to_raw());
             cluster_old_sym_idx.push(i as u32);
-        }
-
-        if has_vectors {
-            if let Some(vec) = reader.vector(rec.vector_index) {
-                vectors.push(vec.to_vec());
-            }
         }
     }
 
@@ -426,6 +467,52 @@ pub(super) fn reconstruct_unchanged(
         }
     }
 
+    // Carry the ordinary name-to-(file,line) FST refs independently from
+    // resolved ref_edges: unresolved and ref-only files have no symbol row
+    // from which to reconstruct these occurrences.
+    let mut file_indices: HashMap<String, usize> = parsed_files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| (file.path.clone(), index))
+        .collect();
+    if let Some(ref_reader) = reader.ref_reader() {
+        ref_reader.for_each_by_prefix("", |name, entries| {
+            if name.is_empty() {
+                return;
+            }
+            for entry in entries {
+                let Some(path) = old_file_paths.get(entry.file_id as usize) else {
+                    tracing::warn!(
+                        file_id = entry.file_id,
+                        "refs FST corruption: file_id past file_paths"
+                    );
+                    continue;
+                };
+                if changed.contains(path.as_str()) || deleted.contains(path.as_str()) {
+                    continue;
+                }
+                let file_index = *file_indices.entry(path.clone()).or_insert_with(|| {
+                    parsed_files.push(ParsedFile {
+                        path: path.clone(),
+                        symbols: Vec::new(),
+                        refs: Vec::new(),
+                        call_edges: Vec::new(),
+                        bound_refs: Vec::new(),
+                        skeletons: Vec::new(),
+                        cpp_includes: Vec::new(),
+                        trigram_bloom: None,
+                        hierarchy_captures: Vec::new(),
+                    });
+                    parsed_files.len() - 1
+                });
+                parsed_files[file_index].refs.push(ParsedRef {
+                    name: name.to_owned(),
+                    line: entry.line as usize,
+                    context: None,
+                });
+            }
+        });
+    }
     // P2a (`docs/HIERARCHY-EDGES.md` §8, architect CRITICAL-1 — mandatory):
     // carry forward hierarchy captures for unchanged files.
     //
@@ -544,16 +631,315 @@ pub(super) fn reconstruct_unchanged(
         }
     }
 
+    if has_vectors
+        && u32::try_from(next_vector_index)
+            .ok()
+            .is_some_and(|next| reader.vector(next).is_some())
+    {
+        vector_mapping_valid = false;
+    }
+    let permutation = if vector_mapping_valid {
+        match canonicalize_parsed_files_with_vectors(
+            &mut parsed_files,
+            &mut vectors,
+            &vector_source_symbols,
+        ) {
+            Ok(permutation) => permutation,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "invalid reconstructed vector mapping; dropping vectors"
+                );
+                vector_mapping_valid = false;
+                vectors.clear();
+                vector_source_symbols.clear();
+                canonicalize_parsed_files(&mut parsed_files)
+            }
+        }
+    } else {
+        tracing::warn!("invalid reconstructed vector mapping; dropping vectors");
+        vectors.clear();
+        vector_source_symbols.clear();
+        canonicalize_parsed_files(&mut parsed_files)
+    };
+    let reconstructed_symbol_count: usize =
+        parsed_files.iter().map(|file| file.symbols.len()).sum();
+    let mut cluster_carry_valid = true;
+    if cluster_reader.is_some()
+        && (cluster_carried.len() != reconstructed_symbol_count
+            || cluster_old_sym_idx.len() != reconstructed_symbol_count
+            || apply_symbol_permutation(&mut cluster_carried, &permutation).is_err()
+            || apply_symbol_permutation(&mut cluster_old_sym_idx, &permutation).is_err())
+    {
+        tracing::warn!("invalid reconstructed cluster mapping; dropping cluster carry");
+        cluster_carried.clear();
+        cluster_old_sym_idx.clear();
+        cluster_carry_valid = false;
+    }
     ReconstructionResult {
         parsed_files,
         vectors,
+        vector_source_symbols,
+        vector_mapping_valid,
         reconstructed_refs,
         old_file_paths,
         reconstructed_unresolved_refs,
         cluster_carried,
         cluster_old_sym_idx,
+        cluster_carry_valid,
         cluster_old_symbols_by_changed_path,
     }
+}
+
+pub(super) fn canonicalize_parsed_files(parsed: &mut [ParsedFile]) -> Vec<usize> {
+    match canonicalization_plan(parsed, 0, &[]) {
+        Ok(plan) => {
+            let _ = apply_symbol_permutation(parsed, &plan.file_permutation);
+            plan.symbol_permutation
+        }
+        Err(_) => {
+            let mut file_permutation: Vec<_> = (0..parsed.len()).collect();
+            file_permutation.sort_by_cached_key(|&index| parsed[index].path.replace('\\', "/"));
+            let mut symbol_permutation = Vec::new();
+            let mut file_starts = Vec::with_capacity(parsed.len());
+            let mut next_symbol = 0usize;
+            for file in parsed.iter() {
+                file_starts.push(next_symbol);
+                let Some(end) = next_symbol.checked_add(file.symbols.len()) else {
+                    return Vec::new();
+                };
+                next_symbol = end;
+            }
+            for &file_index in &file_permutation {
+                let start = file_starts[file_index];
+                let Some(end) = start.checked_add(parsed[file_index].symbols.len()) else {
+                    return Vec::new();
+                };
+                symbol_permutation.extend(start..end);
+            }
+            let _ = apply_symbol_permutation(parsed, &file_permutation);
+            symbol_permutation
+        }
+    }
+}
+
+/// Reorders vectors by the source symbol they belong to, then returns the full symbol permutation.
+///
+/// `vector_source_symbols[index]` names the input symbol for `vectors[index]`. Sources are ordered,
+/// and each file's covered symbols must form a prefix; at most one file may be partial.
+pub(super) fn canonicalize_parsed_files_with_vectors(
+    parsed: &mut [ParsedFile],
+    vectors: &mut [Vec<f32>],
+    vector_source_symbols: &[usize],
+) -> Result<Vec<usize>, InvalidVectorMapping> {
+    let plan = canonicalization_plan(parsed, vectors.len(), vector_source_symbols)?;
+    apply_symbol_permutation(vectors, &plan.vector_permutation)
+        .map_err(InvalidVectorMapping::InvalidPermutation)?;
+    apply_symbol_permutation(parsed, &plan.file_permutation)
+        .map_err(InvalidVectorMapping::InvalidPermutation)?;
+    Ok(plan.symbol_permutation)
+}
+
+#[derive(Debug)]
+pub(super) enum InvalidVectorMapping {
+    VectorSourceLength,
+    TooManyVectorSources,
+    SourcesNotStrictlyIncreasing,
+    SourceOutOfBounds,
+    NonPrefixFileCoverage,
+    MultiplePartialFiles,
+    SymbolCountOverflow,
+    InvalidPermutation(InvalidPermutation),
+}
+
+impl std::fmt::Display for InvalidVectorMapping {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VectorSourceLength => formatter.write_str("vector/source length mismatch"),
+            Self::TooManyVectorSources => formatter.write_str("too many vector sources"),
+            Self::SourcesNotStrictlyIncreasing => {
+                formatter.write_str("vector sources are not strictly increasing")
+            }
+            Self::SourceOutOfBounds => formatter.write_str("vector source is out of bounds"),
+            Self::NonPrefixFileCoverage => {
+                formatter.write_str("vectors do not cover a file prefix")
+            }
+            Self::MultiplePartialFiles => formatter.write_str("multiple files are partial"),
+            Self::SymbolCountOverflow => formatter.write_str("symbol count overflow"),
+            Self::InvalidPermutation(error) => write!(formatter, "invalid permutation: {error}"),
+        }
+    }
+}
+
+impl std::fmt::Display for InvalidPermutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Length => formatter.write_str("permutation length mismatch"),
+            Self::OutOfBounds => formatter.write_str("permutation index is out of bounds"),
+            Self::Duplicate => formatter.write_str("permutation contains a duplicate index"),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum InvalidPermutation {
+    Length,
+    OutOfBounds,
+    Duplicate,
+}
+
+struct CanonicalizationPlan {
+    file_permutation: Vec<usize>,
+    symbol_permutation: Vec<usize>,
+    vector_permutation: Vec<usize>,
+}
+
+fn canonicalization_plan(
+    parsed: &[ParsedFile],
+    vector_count: usize,
+    vector_source_symbols: &[usize],
+) -> Result<CanonicalizationPlan, InvalidVectorMapping> {
+    if vector_count != vector_source_symbols.len() {
+        return Err(InvalidVectorMapping::VectorSourceLength);
+    }
+    let symbol_count = parsed.iter().try_fold(0usize, |count, file| {
+        count
+            .checked_add(file.symbols.len())
+            .ok_or(InvalidVectorMapping::SymbolCountOverflow)
+    })?;
+    if vector_source_symbols.len() > symbol_count {
+        return Err(InvalidVectorMapping::TooManyVectorSources);
+    }
+    if !vector_source_symbols
+        .windows(2)
+        .all(|pair| pair[0] < pair[1])
+    {
+        return Err(InvalidVectorMapping::SourcesNotStrictlyIncreasing);
+    }
+    if vector_source_symbols
+        .last()
+        .is_some_and(|&source| source >= symbol_count)
+    {
+        return Err(InvalidVectorMapping::SourceOutOfBounds);
+    }
+
+    let mut file_starts = Vec::with_capacity(parsed.len());
+    let mut coverage_groups = Vec::with_capacity(parsed.len());
+    let mut next_symbol = 0usize;
+    let mut partial_file_count = 0;
+    let has_partial_coverage =
+        !vector_source_symbols.is_empty() && vector_source_symbols.len() < symbol_count;
+    for file in parsed.iter() {
+        let file_start = next_symbol;
+        let file_symbol_count = file.symbols.len();
+        let file_end = file_start
+            .checked_add(file_symbol_count)
+            .ok_or(InvalidVectorMapping::SymbolCountOverflow)?;
+        let first_covered = vector_source_symbols.partition_point(|&index| index < file_start);
+        let after_covered = vector_source_symbols.partition_point(|&index| index < file_end);
+        let covered_count = after_covered - first_covered;
+        let covered_end = file_start
+            .checked_add(covered_count)
+            .ok_or(InvalidVectorMapping::SymbolCountOverflow)?;
+        if !vector_source_symbols[first_covered..after_covered]
+            .iter()
+            .copied()
+            .eq(file_start..covered_end)
+        {
+            return Err(InvalidVectorMapping::NonPrefixFileCoverage);
+        }
+        file_starts.push(file_start);
+        let group = if !has_partial_coverage {
+            0
+        } else if file_symbol_count == 0 || covered_count == 0 {
+            2
+        } else if covered_count == file_symbol_count {
+            0
+        } else {
+            partial_file_count += 1;
+            1
+        };
+        coverage_groups.push(group);
+        next_symbol = file_end;
+    }
+    if partial_file_count > 1 {
+        return Err(InvalidVectorMapping::MultiplePartialFiles);
+    }
+
+    let mut file_permutation: Vec<_> = (0..parsed.len()).collect();
+    file_permutation.sort_by_cached_key(|&index| {
+        (
+            coverage_groups[index],
+            parsed[index].path.replace('\\', "/"),
+        )
+    });
+    let mut permutation = Vec::with_capacity(next_symbol);
+    for &file_index in &file_permutation {
+        let start = file_starts[file_index];
+        let end = start
+            .checked_add(parsed[file_index].symbols.len())
+            .ok_or(InvalidVectorMapping::SymbolCountOverflow)?;
+        permutation.extend(start..end);
+    }
+    validate_symbol_permutation(parsed.len(), &file_permutation)
+        .map_err(InvalidVectorMapping::InvalidPermutation)?;
+    validate_symbol_permutation(symbol_count, &permutation)
+        .map_err(InvalidVectorMapping::InvalidPermutation)?;
+
+    let mut vector_permutation = Vec::with_capacity(vector_source_symbols.len());
+    for source_symbol in permutation.iter().take(vector_source_symbols.len()) {
+        let vector_index = vector_source_symbols
+            .binary_search(source_symbol)
+            .map_err(|_| InvalidVectorMapping::NonPrefixFileCoverage)?;
+        vector_permutation.push(vector_index);
+    }
+    validate_symbol_permutation(vector_count, &vector_permutation)
+        .map_err(InvalidVectorMapping::InvalidPermutation)?;
+
+    Ok(CanonicalizationPlan {
+        file_permutation,
+        symbol_permutation: permutation,
+        vector_permutation,
+    })
+}
+
+fn validate_symbol_permutation(
+    item_count: usize,
+    permutation: &[usize],
+) -> Result<(), InvalidPermutation> {
+    if item_count != permutation.len() {
+        return Err(InvalidPermutation::Length);
+    }
+    let mut seen = vec![false; item_count];
+    for &source in permutation {
+        let Some(slot) = seen.get_mut(source) else {
+            return Err(InvalidPermutation::OutOfBounds);
+        };
+        if *slot {
+            return Err(InvalidPermutation::Duplicate);
+        }
+        *slot = true;
+    }
+    Ok(())
+}
+
+pub(super) fn apply_symbol_permutation<T>(
+    items: &mut [T],
+    permutation: &[usize],
+) -> Result<(), InvalidPermutation> {
+    validate_symbol_permutation(items.len(), permutation)?;
+    let mut source_to_destination = vec![0; items.len()];
+    for (destination, &source) in permutation.iter().enumerate() {
+        source_to_destination[source] = destination;
+    }
+    for current in 0..items.len() {
+        while source_to_destination[current] != current {
+            let other = source_to_destination[current];
+            items.swap(current, other);
+            source_to_destination.swap(current, other);
+        }
+    }
+    Ok(())
 }
 
 /// Phase 14.7 — build the global blob-SHA parse cache and run a
@@ -956,6 +1342,8 @@ pub(super) fn parse_files(
         );
     }
 
+    let mut parsed_files = parsed_files;
+    canonicalize_parsed_files(&mut parsed_files);
     Ok(parsed_files)
 }
 
@@ -1033,6 +1421,349 @@ pub(super) fn discover_files(root: &Path, excludes: &[String]) -> Result<Vec<std
     }
 
     Ok(files)
+}
+
+#[cfg(test)]
+mod reconstruction_file_order_tests {
+    use super::*;
+    use crate::index::types::ClusterCarryArtefacts;
+    use crate::store::format::{CLUSTER_NEW, CLUSTER_UNCLUSTERED};
+    use crate::store::reader::IndexReader;
+    use crate::store::writer::{
+        write_index_full, write_index_with_call_graph_and_skeletons_and_fingerprints, ClusterInput,
+    };
+    use tempfile::TempDir;
+
+    fn symbol(name: &str) -> ParsedSymbol {
+        ParsedSymbol {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            line: 1,
+            signature: None,
+            doc: None,
+            body_tokens: None,
+        }
+    }
+
+    fn file(path: &str, name: &str, refs: &[(&str, usize)]) -> ParsedFile {
+        ParsedFile {
+            path: path.to_string(),
+            symbols: vec![symbol(name)],
+            refs: refs
+                .iter()
+                .map(|(name, line)| ParsedRef {
+                    name: (*name).to_string(),
+                    line: *line,
+                    context: None,
+                })
+                .collect(),
+            call_edges: Vec::new(),
+            bound_refs: Vec::new(),
+            skeletons: Vec::new(),
+            cpp_includes: Vec::new(),
+            trigram_bloom: None,
+            hierarchy_captures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reconstruction_canonicalizes_paths_and_keeps_sidecars_aligned() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index.vex");
+        let parsed = vec![
+            file("z.rs", "Zed", &[("ordinary", 9), ("ordinary", 9)]),
+            file("a.rs", "Aye", &[("ordinary", 2)]),
+            ParsedFile {
+                path: "b.js".to_string(),
+                symbols: Vec::new(),
+                refs: vec![ParsedRef {
+                    name: "ordinary".to_string(),
+                    line: 4,
+                    context: None,
+                }],
+                call_edges: Vec::new(),
+                bound_refs: Vec::new(),
+                skeletons: Vec::new(),
+                cpp_includes: Vec::new(),
+                trigram_bloom: None,
+                hierarchy_captures: Vec::new(),
+            },
+        ];
+        let mut z_vector = vec![0.0; 384];
+        z_vector[0] = 1.0;
+        let mut a_vector = vec![0.0; 384];
+        a_vector[1] = 1.0;
+        let carry = ClusterCarryArtefacts {
+            per_symbol_carried: vec![Some(CLUSTER_NEW), Some(CLUSTER_UNCLUSTERED)],
+            per_symbol_old_idx: vec![Some(0), Some(1)],
+            old_symbol_count: 2,
+            resolution: (1, 8),
+            algo_version: 1,
+            levels: 1,
+            build_symbol_count: 2,
+            ..ClusterCarryArtefacts::default()
+        };
+        write_index_with_call_graph_and_skeletons_and_fingerprints(
+            &parsed,
+            &[z_vector.clone(), a_vector.clone()],
+            384,
+            &[],
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            ClusterInput::Carry(carry),
+            &index_path,
+        )
+        .expect("write fixture index");
+
+        let reader = IndexReader::open(&index_path).expect("open fixture index");
+        let changed = HashSet::new();
+        let deleted = HashSet::new();
+        let cluster_reader = reader
+            .cluster_section_reader()
+            .expect("fixture has a cluster section");
+        let reconstructed =
+            reconstruct_unchanged(&reader, &changed, &deleted, None, Some(&cluster_reader));
+
+        assert_eq!(
+            reconstructed
+                .parsed_files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["a.rs", "b.js", "z.rs"]
+        );
+        assert_eq!(
+            reconstructed
+                .parsed_files
+                .iter()
+                .flat_map(|file| file.symbols.iter().map(|symbol| symbol.name.as_str()))
+                .collect::<Vec<_>>(),
+            ["Aye", "Zed"]
+        );
+        assert_eq!(reconstructed.vectors, [a_vector, z_vector]);
+        assert_eq!(
+            reconstructed.cluster_carried,
+            [CLUSTER_UNCLUSTERED, CLUSTER_NEW]
+        );
+        assert_eq!(reconstructed.cluster_old_sym_idx, [1, 0]);
+
+        let mut carried_refs: Vec<_> = reconstructed
+            .parsed_files
+            .iter()
+            .flat_map(|file| {
+                file.refs
+                    .iter()
+                    .map(move |r| (r.name.as_str(), file.path.as_str(), r.line))
+            })
+            .collect();
+        carried_refs.sort_unstable();
+        assert_eq!(
+            carried_refs,
+            [
+                ("ordinary", "a.rs", 2),
+                ("ordinary", "b.js", 4),
+                ("ordinary", "z.rs", 9),
+                ("ordinary", "z.rs", 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn reconstruction_keeps_a_stored_vector_prefix_inside_a_file() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index.vex");
+        let parsed = vec![ParsedFile {
+            path: "a.rs".to_string(),
+            symbols: vec![symbol("Alpha"), symbol("Beta")],
+            refs: Vec::new(),
+            call_edges: Vec::new(),
+            bound_refs: Vec::new(),
+            skeletons: Vec::new(),
+            cpp_includes: Vec::new(),
+            trigram_bloom: None,
+            hierarchy_captures: Vec::new(),
+        }];
+        let mut alpha_vector = vec![0.0; 384];
+        alpha_vector[0] = f32::from_bits(0x3f81_2345);
+        alpha_vector[1] = f32::from_bits(0x8000_0000);
+        write_index_full(&parsed, &[alpha_vector.clone()], 384, &index_path)
+            .expect("write partial-vector fixture");
+
+        let reader = IndexReader::open(&index_path).expect("open fixture index");
+        let changed = HashSet::new();
+        let deleted = HashSet::new();
+        let reconstructed = reconstruct_unchanged(&reader, &changed, &deleted, None, None);
+        assert_eq!(
+            reconstructed.parsed_files[0]
+                .symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha", "Beta"]
+        );
+        assert_eq!(
+            reconstructed.vectors[0]
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            alpha_vector
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        let mut update_parsed = reconstructed.parsed_files.clone();
+        update_parsed.push(ParsedFile {
+            path: "z.rs".to_string(),
+            symbols: vec![symbol("Zeta")],
+            refs: Vec::new(),
+            call_edges: Vec::new(),
+            bound_refs: Vec::new(),
+            skeletons: Vec::new(),
+            cpp_includes: Vec::new(),
+            trigram_bloom: None,
+            hierarchy_captures: Vec::new(),
+        });
+        let mut zeta_vector = vec![0.0; 384];
+        zeta_vector[0] = f32::from_bits(0x3f65_4321);
+        zeta_vector[1] = f32::from_bits(0x8000_0000);
+        let mut update_vectors = reconstructed.vectors;
+        update_vectors.push(zeta_vector.clone());
+        let vector_source_symbols = [0, 2];
+        canonicalize_parsed_files_with_vectors(
+            &mut update_parsed,
+            &mut update_vectors,
+            &vector_source_symbols,
+        )
+        .expect("valid prefix mapping");
+        assert_eq!(
+            update_parsed
+                .iter()
+                .flat_map(|file| file.symbols.iter().map(|symbol| symbol.name.as_str()))
+                .collect::<Vec<_>>(),
+            ["Zeta", "Alpha", "Beta"]
+        );
+        assert_eq!(
+            update_vectors
+                .iter()
+                .map(|vector| vector
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            [zeta_vector, alpha_vector]
+                .iter()
+                .map(|vector| vector
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn malformed_vector_mappings_do_not_panic_or_mutate_inputs() {
+        let cases: &[(&[usize], usize)] = &[
+            (&[], 1),
+            (&[4], 1),
+            (&[0, 0], 2),
+            (&[1, 0], 2),
+            (&[1], 1),
+            (&[0, 2], 2),
+        ];
+
+        for (sources, vector_count) in cases {
+            let mut first = file("z.rs", "Zed", &[]);
+            first.symbols.push(symbol("Zora"));
+            let mut second = file("a.rs", "Aye", &[]);
+            second.symbols.push(symbol("Ari"));
+            let mut parsed = vec![first, second];
+            let original_paths: Vec<_> = parsed.iter().map(|item| item.path.clone()).collect();
+            let mut vectors: Vec<Vec<f32>> =
+                (0..*vector_count).map(|index| vec![index as f32]).collect();
+            let original_vectors = vectors.clone();
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                canonicalize_parsed_files_with_vectors(&mut parsed, &mut vectors, sources)
+            }));
+
+            assert!(result.is_ok(), "invalid sources {sources:?} must not panic");
+            assert!(
+                result.unwrap().is_err(),
+                "invalid sources {sources:?} must fail preflight"
+            );
+            assert_eq!(
+                parsed
+                    .iter()
+                    .map(|item| item.path.clone())
+                    .collect::<Vec<_>>(),
+                original_paths,
+                "invalid sources {sources:?} must not reorder files"
+            );
+            assert_eq!(
+                vectors, original_vectors,
+                "invalid inputs must remain intact"
+            );
+        }
+    }
+
+    #[test]
+    fn reconstruction_drops_all_vectors_for_corrupt_stored_prefixes() {
+        use crate::store::format::SymbolRecord;
+
+        for corrupted_index in [u32::MAX, 0, 4] {
+            let tmp = TempDir::new().unwrap();
+            let index_path = tmp.path().join("index.vex");
+            let mut fixture = file("a.rs", "Alpha", &[("ordinary", 7)]);
+            fixture.symbols.extend([symbol("Beta"), symbol("Gamma")]);
+            let vectors = [
+                vec![f32::from_bits(0x3f80_0001); 384],
+                vec![f32::from_bits(0x3f80_0002); 384],
+                vec![f32::from_bits(0x3f80_0003); 384],
+            ];
+            write_index_full(&[fixture], &vectors, 384, &index_path).expect("write vector fixture");
+
+            let reader = IndexReader::open(&index_path).expect("open fixture index");
+            let symbols_offset = reader.header().symbols_offset as usize;
+            drop(reader);
+            let field_offset = symbols_offset
+                + SymbolRecord::SIZE
+                + (SymbolRecord::SIZE - std::mem::size_of::<u32>());
+            let mut bytes = std::fs::read(&index_path).expect("read fixture index");
+            bytes[field_offset..field_offset + std::mem::size_of::<u32>()]
+                .copy_from_slice(&corrupted_index.to_le_bytes());
+            std::fs::write(&index_path, bytes).expect("corrupt middle vector mapping");
+
+            let reader = IndexReader::open(&index_path).expect("open corrupted index");
+            let changed = HashSet::new();
+            let deleted = HashSet::new();
+            let reconstructed = reconstruct_unchanged(&reader, &changed, &deleted, None, None);
+
+            assert!(!reconstructed.vector_mapping_valid);
+            assert!(reconstructed.vectors.is_empty());
+            assert!(reconstructed.vector_source_symbols.is_empty());
+            assert_eq!(
+                reconstructed.parsed_files[0]
+                    .symbols
+                    .iter()
+                    .map(|symbol| symbol.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["Alpha", "Beta", "Gamma"]
+            );
+            assert_eq!(
+                reconstructed.parsed_files[0]
+                    .refs
+                    .iter()
+                    .map(|reference| (reference.name.as_str(), reference.line))
+                    .collect::<Vec<_>>(),
+                [("ordinary", 7)]
+            );
+        }
+    }
 }
 
 #[cfg(test)]
