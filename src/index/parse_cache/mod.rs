@@ -46,7 +46,6 @@
 pub mod git_blobs;
 
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
@@ -96,9 +95,10 @@ fn cache_fingerprint_for_lang(lang: Language) -> u32 {
     if lang != Language::Dart {
         return grammar_fingerprint;
     }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (grammar_fingerprint, crate::index::parse_revision::DART).hash(&mut hasher);
-    hasher.finish() as u32
+    let mut input = [0; 6];
+    input[..4].copy_from_slice(&grammar_fingerprint.to_le_bytes());
+    input[4..].copy_from_slice(&crate::index::parse_revision::DART.to_le_bytes());
+    xxhash_rust::xxh3::xxh3_64(&input) as u32
 }
 
 /// On-disk header size: 4 (magic) + 2 (version) + 4 (fingerprint).

@@ -2,13 +2,73 @@ use tree_sitter::Node;
 
 use crate::parse::NodeTextExt;
 
+#[derive(Default)]
+pub(crate) struct DeclarationContext {
+    classes: std::collections::HashSet<String>,
+    top_level_functions: std::collections::HashSet<String>,
+}
+
+impl DeclarationContext {
+    pub(crate) fn from_tree(tree: &tree_sitter::Tree, source: &[u8]) -> Self {
+        let mut context = Self::default();
+        let mut pending = vec![tree.root_node()];
+        while let Some(node) = pending.pop() {
+            if node.kind() == "function_declaration" {
+                if let Some(name) = node
+                    .child_by_field_name("signature")
+                    .and_then(|signature| signature.child_by_field_name("name"))
+                {
+                    context
+                        .top_level_functions
+                        .insert(name.node_text(source).to_string());
+                }
+            }
+            if node.kind() == "class_definition" {
+                if let Some(name) = node.child_by_field_name("name") {
+                    context.classes.insert(name.node_text(source).to_string());
+                }
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        context
+    }
+}
+
+fn enclosing_class(mut node: Node<'_>) -> Option<Node<'_>> {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "class_definition" {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
 pub(crate) fn declaration_identity(node: Node<'_>, source: &[u8]) -> Option<String> {
     if node.kind() != "identifier" {
         return None;
     }
     let signature = node.parent()?;
     if !is_constructor_signature(signature.kind()) {
-        return None;
+        let method_signature = signature.parent()?;
+        if method_signature.kind() != "method_signature" {
+            return None;
+        }
+        let method = method_signature.parent()?;
+        if method.kind() != "method_declaration" {
+            return None;
+        }
+        let mut cursor = method_signature.walk();
+        if !method_signature
+            .children(&mut cursor)
+            .any(|child| child.kind() == "static")
+        {
+            return None;
+        }
+        let owner = enclosing_class(method)?;
+        let class_name = owner.child_by_field_name("name")?.node_text(source);
+        return Some(format!("{class_name}.{}", node.node_text(source)));
     }
     let identifiers = direct_identifiers(signature);
     if !identifiers.iter().take(2).any(|id| id.id() == node.id()) {
@@ -38,6 +98,7 @@ pub(crate) fn is_constructor_declaration_identifier(node: Node<'_>) -> bool {
 pub(crate) fn call_identity<'tree>(
     node: Node<'tree>,
     source: &[u8],
+    context: &DeclarationContext,
 ) -> Option<(Node<'tree>, Option<Node<'tree>>, String)> {
     match node.kind() {
         "constructor_invocation" | "new_expression" | "const_object_expression" => {
@@ -73,11 +134,33 @@ pub(crate) fn call_identity<'tree>(
             };
             let owner = *identifiers.first()?;
             let owner_name = owner.node_text(source);
-            if !owner_name.chars().next()?.is_uppercase() {
-                return None;
-            }
             let suffix = identifiers.get(1).copied();
-            let name = suffix.map_or("new", |n| n.node_text(source));
+            let member = suffix.map(|n| n.node_text(source));
+            let has_type_arguments =
+                node.child_by_field_name("arguments")
+                    .is_some_and(|arguments| {
+                        let mut cursor = arguments.walk();
+                        let has_type_arguments = arguments
+                            .named_children(&mut cursor)
+                            .any(|child| child.kind() == "type_arguments");
+                        has_type_arguments
+                    });
+            let name = match member {
+                Some(member)
+                    if context.classes.contains(owner_name)
+                        || owner_name.chars().next()?.is_uppercase() =>
+                {
+                    member
+                }
+                None if (context.classes.contains(owner_name)
+                    || (has_type_arguments
+                        && owner_name.chars().next().is_some_and(char::is_uppercase)))
+                    && !context.top_level_functions.contains(owner_name) =>
+                {
+                    "new"
+                }
+                _ => return None,
+            };
             (!owner_name.is_empty() && !name.is_empty())
                 .then(|| (owner, suffix, format!("{owner_name}.{name}")))
         }
@@ -85,13 +168,17 @@ pub(crate) fn call_identity<'tree>(
     }
 }
 
-pub(crate) fn call_identity_for_capture(node: Node<'_>, source: &[u8]) -> Option<String> {
+pub(crate) fn call_identity_for_capture(
+    node: Node<'_>,
+    source: &[u8],
+    context: &DeclarationContext,
+) -> Option<String> {
     let mut current = node;
     while let Some(parent) = current.parent() {
         if is_invocation(parent.kind()) {
-            return call_identity(parent, source).map(|(_, _, name)| name);
+            return call_identity(parent, source, context).map(|(_, _, name)| name);
         }
-        if let Some((_, _, name)) = call_identity(parent, source) {
+        if let Some((_, _, name)) = call_identity(parent, source, context) {
             return Some(name);
         }
         if matches!(

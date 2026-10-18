@@ -24,6 +24,7 @@ use super::scope;
 use crate::channel::{
     build_def_sites, Channel, ChannelContext, FstRefsChannel, HitLocation, StrictRefsChannel,
 };
+use crate::parse::language::Language;
 use crate::protocol::capabilities;
 use crate::store::reader::IndexReader;
 use crate::util::config::VexConfig;
@@ -401,7 +402,11 @@ fn has_dart_only_definition(reader: &IndexReader, name: &str) -> bool {
         let Some(symbol) = reader.symbol(idx as usize) else {
             continue;
         };
-        if reader.read_string(symbol.file_offset).ends_with(".dart") {
+        let language = Path::new(reader.read_string(symbol.file_offset))
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(Language::from_extension);
+        if language == Some(Language::Dart) {
             dart = true;
         } else {
             other = true;

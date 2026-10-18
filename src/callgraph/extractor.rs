@@ -311,6 +311,9 @@ fn extract_callgraph_with_tree(
     lang: Language,
 ) -> Option<(Vec<FnDef>, Vec<Call>)> {
     let query = compiled_query(lang)?;
+    let dart_context = (lang == Language::Dart).then(|| {
+        crate::parse::extractor::dart::DeclarationContext::from_tree(tree, content.as_bytes())
+    });
 
     let fn_name_idx = query.capture_index_for_name("fn.name")?;
     let fn_body_idx = query.capture_index_for_name("fn.decl")?;
@@ -406,11 +409,16 @@ fn extract_callgraph_with_tree(
                     continue;
                 }
                 call_name = Some(if lang == Language::Dart {
-                    crate::parse::extractor::dart::call_identity_for_capture(
-                        capture.node,
-                        content.as_bytes(),
-                    )
-                    .unwrap_or_else(|| text.to_string())
+                    dart_context
+                        .as_ref()
+                        .and_then(|context| {
+                            crate::parse::extractor::dart::call_identity_for_capture(
+                                capture.node,
+                                content.as_bytes(),
+                                context,
+                            )
+                        })
+                        .unwrap_or_else(|| text.to_string())
                 } else {
                     text.to_string()
                 });

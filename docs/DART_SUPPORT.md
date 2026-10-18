@@ -6,6 +6,8 @@ offline and does not execute or require the Dart SDK.
 The extractor indexes classes, enums, mixins, extensions, extension types,
 functions, methods, constructors, type aliases, enum constants, and imports.
 Constructors use qualified identities such as `Repo.new` and `Repo.named`.
+Class static methods use `Owner.member`; top-level functions retain their
+declared names, including names that start with an uppercase letter.
 Call edges are syntactic; hierarchy edges retain `extends`, `implements`, and
 `with` relations. References use the shared identifier filter and are not
 resolved by a compiler or across imported libraries.

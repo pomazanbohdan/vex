@@ -9,7 +9,7 @@ const MAGIC: &[u8; 4] = b"VEXR";
 // existing index; a missing or old marker forces one migration update.
 // Serialized `ParsedFile` shape changes instead bump `CACHE_FORMAT_VERSION`.
 pub(super) const BASELINE: u16 = 1;
-pub(super) const DART: u16 = 2;
+pub(super) const DART: u16 = 3;
 pub(super) const CURRENT: u16 = DART;
 pub(super) const FILE_NAME: &str = "index.parse-revision";
 
@@ -180,7 +180,7 @@ mod tests {
         save(tmp.path(), DART).unwrap();
         assert_eq!(
             fs::read(tmp.path().join(FILE_NAME)).unwrap(),
-            b"VEXR\x02\x00"
+            b"VEXR\x03\x00"
         );
         assert!(is_current(tmp.path(), DART));
         assert!(is_current(tmp.path(), BASELINE));
@@ -195,7 +195,25 @@ mod tests {
     #[test]
     fn marker_revision_above_supported_range_is_stale() {
         let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join(FILE_NAME), b"VEXR\x03\x00").unwrap();
+        fs::write(tmp.path().join(FILE_NAME), marker_bytes(CURRENT + 1)).unwrap();
         assert!(!is_current(tmp.path(), BASELINE));
+    }
+
+    #[test]
+    fn previous_dart_revision_requires_refresh_but_stays_known_for_native_paths() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(FILE_NAME), b"VEXR\x02\x00").unwrap();
+        assert!(is_current(tmp.path(), BASELINE));
+        assert!(!is_current(tmp.path(), DART));
+        save(tmp.path(), BASELINE).unwrap();
+        assert_eq!(
+            fs::read(tmp.path().join(FILE_NAME)).unwrap(),
+            b"VEXR\x02\x00"
+        );
+        save(tmp.path(), DART).unwrap();
+        assert_eq!(
+            fs::read(tmp.path().join(FILE_NAME)).unwrap(),
+            b"VEXR\x03\x00"
+        );
     }
 }

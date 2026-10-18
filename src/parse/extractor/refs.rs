@@ -93,7 +93,16 @@ pub(crate) fn extract_references_ast_with_tree(
     // `content.lines().nth(n)` per identifier node; on identifier-dense
     // files that compounded to O(line_count × ident_count).
     let line_slices: Vec<&str> = content.lines().collect();
-    walk_for_refs(tree.root_node(), content, &line_slices, lang, &mut refs);
+    let dart_context = (lang == Language::Dart)
+        .then(|| super::dart::DeclarationContext::from_tree(tree, content.as_bytes()));
+    walk_for_refs(
+        tree.root_node(),
+        content,
+        &line_slices,
+        lang,
+        dart_context.as_ref(),
+        &mut refs,
+    );
     refs
 }
 
@@ -102,13 +111,14 @@ fn walk_for_refs(
     content: &str,
     lines: &[&str],
     lang: Language,
+    dart_context: Option<&super::dart::DeclarationContext>,
     refs: &mut Vec<ParsedRef>,
 ) {
     let kind = node.kind();
 
     if lang == Language::Dart {
-        if let Some((owner, suffix, qualified_name)) =
-            super::dart::call_identity(node, content.as_bytes())
+        if let Some((owner, suffix, qualified_name)) = dart_context
+            .and_then(|context| super::dart::call_identity(node, content.as_bytes(), context))
         {
             let line = owner.start_position().row + 1;
             let context = lines.get(line - 1).map(|l| l.trim().to_string());
@@ -132,9 +142,9 @@ fn walk_for_refs(
                 let function = node.child_by_field_name("function");
                 for child in node.children(&mut cursor) {
                     if function.is_some_and(|function| function.id() == child.id()) {
-                        walk_type_arguments(child, content, lines, lang, refs);
+                        walk_type_arguments(child, content, lines, lang, dart_context, refs);
                     } else {
-                        walk_for_refs(child, content, lines, lang, refs);
+                        walk_for_refs(child, content, lines, lang, dart_context, refs);
                     }
                 }
             } else {
@@ -142,7 +152,7 @@ fn walk_for_refs(
                     if !contains_node(child, owner)
                         && suffix.is_none_or(|suffix| !contains_node(child, suffix))
                     {
-                        walk_for_refs(child, content, lines, lang, refs);
+                        walk_for_refs(child, content, lines, lang, dart_context, refs);
                     }
                 }
             }
@@ -169,14 +179,17 @@ fn walk_for_refs(
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child.kind() == interp_kind {
-                walk_for_refs(child, content, lines, lang, refs);
+                walk_for_refs(child, content, lines, lang, dart_context, refs);
             }
         }
         return;
     }
 
     if is_identifier_kind(kind) || (lang == Language::Dart && kind == "identifier_dollar_escaped") {
-        if lang == Language::Dart && super::dart::is_constructor_declaration_identifier(node) {
+        if lang == Language::Dart
+            && (super::dart::is_constructor_declaration_identifier(node)
+                || super::dart::declaration_identity(node, content.as_bytes()).is_some())
+        {
             return;
         }
         let text = node.node_text(content.as_bytes());
@@ -194,7 +207,7 @@ fn walk_for_refs(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_for_refs(child, content, lines, lang, refs);
+        walk_for_refs(child, content, lines, lang, dart_context, refs);
     }
 }
 
@@ -207,15 +220,16 @@ fn walk_type_arguments(
     content: &str,
     lines: &[&str],
     lang: Language,
+    dart_context: Option<&super::dart::DeclarationContext>,
     refs: &mut Vec<ParsedRef>,
 ) {
     if node.kind() == "type_arguments" {
-        walk_for_refs(node, content, lines, lang, refs);
+        walk_for_refs(node, content, lines, lang, dart_context, refs);
         return;
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_type_arguments(child, content, lines, lang, refs);
+        walk_type_arguments(child, content, lines, lang, dart_context, refs);
     }
 }
 

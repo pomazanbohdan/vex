@@ -283,3 +283,103 @@ fn dart_ast_refs_keep_interpolation_and_drop_literal_text() {
         .iter()
         .any(|r| r.name == "literalGhost" || r.name == "commentGhost"));
 }
+
+#[test]
+fn dart_static_method_calls_keep_qualified_identity_and_owner() {
+    let source = "int helper() => 1; class Util { static int computeTotal() => helper(); } void invoke() { Util.computeTotal(); }";
+    let parsed = vex::parse::parse_file("sample.dart", source, dart()).unwrap();
+
+    assert!(
+        parsed.symbols.iter().any(|s| s.name == "Util.computeTotal"),
+        "static method keeps its qualified symbol identity: {:?}",
+        parsed.symbols
+    );
+    assert!(
+        parsed
+            .call_edges
+            .iter()
+            .any(|e| e.caller_fn_name == "Util.computeTotal" && e.callee_name == "helper"),
+        "helper call belongs to the qualified static method: {:?}",
+        parsed.call_edges
+    );
+    assert!(
+        parsed
+            .call_edges
+            .iter()
+            .any(|e| e.caller_fn_name == "invoke" && e.callee_name == "Util.computeTotal"),
+        "static method call uses qualified callee identity: {:?}",
+        parsed.call_edges
+    );
+}
+
+#[test]
+fn dart_top_level_uppercase_function_call_stays_bare() {
+    let source = "int Foo() => 1; void invoke() { Foo(); }";
+    let parsed = vex::parse::parse_file("sample.dart", source, dart()).unwrap();
+
+    assert!(
+        parsed.symbols.iter().any(|s| s.name == "Foo"),
+        "top-level function keeps its declared name: {:?}",
+        parsed.symbols
+    );
+    assert!(
+        parsed
+            .call_edges
+            .iter()
+            .any(|e| e.caller_fn_name == "invoke" && e.callee_name == "Foo"),
+        "top-level uppercase function call stays bare: {:?}",
+        parsed.call_edges
+    );
+    assert!(
+        !parsed.call_edges.iter().any(|e| e.callee_name == "Foo.new"),
+        "uppercase function call is not rewritten as a constructor: {:?}",
+        parsed.call_edges
+    );
+}
+
+#[test]
+fn dart_constructor_and_instance_method_identities_are_preserved_together() {
+    let source = "int helper() => 1; class Owner { Owner(); Owner.named(); int foo() => helper(); } void invoke(Owner value) { Owner(); Owner.named(); value.foo(); }";
+    let parsed = vex::parse::parse_file("sample.dart", source, dart()).unwrap();
+
+    for name in ["Owner.new", "Owner.named"] {
+        assert!(
+            parsed.symbols.iter().any(|s| s.name == name),
+            "missing qualified constructor {name}: {:?}",
+            parsed.symbols
+        );
+        assert!(
+            parsed
+                .call_edges
+                .iter()
+                .any(|e| e.caller_fn_name == "invoke" && e.callee_name == name),
+            "constructor call uses qualified identity {name}: {:?}",
+            parsed.call_edges
+        );
+    }
+    assert!(
+        parsed
+            .call_edges
+            .iter()
+            .any(|e| e.caller_fn_name == "invoke" && e.callee_name == "foo"),
+        "instance call remains bare: {:?}",
+        parsed.call_edges
+    );
+    assert!(
+        parsed.symbols.iter().any(|s| s.name == "foo"),
+        "ordinary instance method keeps its bare name: {:?}",
+        parsed.symbols
+    );
+}
+
+#[test]
+fn dart_unresolved_generic_function_call_stays_bare() {
+    let edges = extract_call_edges("void invoke() { fetch<int>(); }", dart());
+    assert!(
+        edges
+            .iter()
+            .any(|(from, _, to, _)| from == "invoke" && to == "fetch"),
+        "generic function call must not become a constructor: {edges:?}"
+    );
+    assert!(!edges.iter().any(|(_, _, to, _)| to == "fetch.new"));
+}
