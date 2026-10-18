@@ -74,7 +74,7 @@ pub fn find_similar(
     // a single query, so the win is zero — but keeping the same shape
     // as `find_duplicates` makes the code uniform and prevents future
     // multi-query callers from accidentally reopening.
-    let hnsw = semantic::HnswHandle::open(hnsw_path, target_vec.len(), reader.symbol_count());
+    let hnsw = semantic::HnswHandle::open(hnsw_path, target_vec.len(), reader);
     let scored = nearest_neighbors(reader, target_vec, limit + 1, hnsw.as_ref(), normalized);
 
     // Filter: drop self, drop below threshold, drop out-of-bounds indices
@@ -143,7 +143,7 @@ pub fn find_duplicates(
         .and_then(|rec| reader.vector(rec.vector_index))
         .map(|v| v.len())
         .unwrap_or(crate::store::format::VECTOR_DIM as usize);
-    let hnsw = semantic::HnswHandle::open(hnsw_path, query_dim, reader.symbol_count());
+    let hnsw = semantic::HnswHandle::open(hnsw_path, query_dim, reader);
 
     // v1.15.0 A1: parallel outer loop. Each symbol's `nearest_neighbors`
     // call is independent — reader/body_lines/hnsw are all `&` borrows,
@@ -245,7 +245,7 @@ fn per_symbol_duplicate_candidates(
     };
 
     let scored = nearest_neighbors(reader, query_vec, neighbors_per_sym, hnsw, normalized);
-    let mut out = Vec::with_capacity(scored.len());
+    let mut out = Vec::with_capacity(scored.len().min(neighbors_per_sym));
     for (other_idx, sim) in scored {
         if other_idx == sym_idx {
             continue;
@@ -260,6 +260,9 @@ fn per_symbol_duplicate_candidates(
             continue;
         }
         out.push((sim, sym_idx, other_idx));
+        if out.len() == neighbors_per_sym {
+            break;
+        }
     }
     out
 }
@@ -271,16 +274,14 @@ fn per_symbol_duplicate_candidates(
 fn nearest_neighbors(
     reader: &IndexReader,
     query_vec: &[f32],
-    top_k: usize,
+    candidate_limit: usize,
     hnsw: Option<&semantic::HnswHandle>,
     normalized: bool,
 ) -> Vec<(usize, f32)> {
     if let Some(handle) = hnsw {
-        if let Some(scored) = handle.search(query_vec, top_k) {
+        if let Some(scored) = handle.search_with_aliases(query_vec, candidate_limit, reader) {
             return scored;
         }
-        // search() returned None — usearch internal error. Fall through
-        // to brute-force rather than returning empty.
     }
 
     // Brute-force fallback.
@@ -298,7 +299,7 @@ fn nearest_neighbors(
         }
     }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(top_k);
+    scored.truncate(candidate_limit);
     scored
 }
 

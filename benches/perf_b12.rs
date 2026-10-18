@@ -122,7 +122,10 @@ fn corpus() -> &'static Corpus {
 /// Materialise a fresh HNSW + hash-index sidecar at `cache_dir` from
 /// the cached corpus. Used by every incremental bench's `iter_batched`
 /// setup closure to provide a clean baseline per iteration.
-fn seed_baseline(cache_dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+fn seed_baseline(
+    cache_dir: &Path,
+    current_vectors: &[Vec<f32>],
+) -> (std::path::PathBuf, std::path::PathBuf) {
     let hnsw_path = cache_dir.join("index.hnsw");
     let hash_path = cache_dir.join("index.hashes");
     let c = corpus();
@@ -132,8 +135,41 @@ fn seed_baseline(cache_dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     // production parameter changes. Now the bench tracks production
     // exactly — a connectivity / expansion tweak in output.rs applies
     // here without code-level synchronisation.
+    write_fixture_index(cache_dir, &c.vectors);
     build_hnsw_at(&hnsw_path, &hash_path, &c.vectors, &c.hashes).expect("seed build_hnsw_at");
+    write_fixture_index(cache_dir, current_vectors);
     (hnsw_path, hash_path)
+}
+
+fn write_fixture_index(dir: &Path, vectors: &[Vec<f32>]) {
+    use vex::index::symbols::{ParsedFile, ParsedSymbol, SymbolKind};
+    let parsed = vec![ParsedFile {
+        path: "fixture.rs".into(),
+        symbols: (0..vectors.len())
+            .map(|i| ParsedSymbol {
+                name: format!("symbol_{i}"),
+                kind: SymbolKind::Function,
+                line: i + 1,
+                signature: None,
+                doc: None,
+                body_tokens: None,
+            })
+            .collect(),
+        refs: vec![],
+        call_edges: vec![],
+        bound_refs: vec![],
+        skeletons: vec![],
+        cpp_includes: vec![],
+        trigram_bloom: None,
+        hierarchy_captures: vec![],
+    }];
+    vex::store::writer::write_index_full(
+        &parsed,
+        vectors,
+        vectors[0].len() as u32,
+        &dir.join("index.vex"),
+    )
+    .unwrap();
 }
 
 /// Replace the first `churn` entries of the cached corpus with fresh
@@ -209,7 +245,11 @@ fn bench_b12(c: &mut Criterion) {
     group.bench_function("full_rebuild_baseline", |b| {
         let cor = corpus();
         b.iter_batched(
-            || TempDir::new().expect("tempdir"),
+            || {
+                let tmp = TempDir::new().expect("tempdir");
+                write_fixture_index(tmp.path(), &cor.vectors);
+                tmp
+            },
             |tmp| {
                 let hnsw_path = tmp.path().join("index.hnsw");
                 let hash_path = tmp.path().join("index.hashes");
@@ -227,7 +267,7 @@ fn bench_b12(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let tmp = TempDir::new().expect("tempdir");
-                let (hnsw_path, hash_path) = seed_baseline(tmp.path());
+                let (hnsw_path, hash_path) = seed_baseline(tmp.path(), &cor.vectors);
                 (tmp, hnsw_path, hash_path)
             },
             |(tmp, hnsw_path, hash_path)| {
@@ -246,7 +286,7 @@ fn bench_b12(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let tmp = TempDir::new().expect("tempdir");
-                let (hnsw_path, hash_path) = seed_baseline(tmp.path());
+                let (hnsw_path, hash_path) = seed_baseline(tmp.path(), &v_1pct);
                 (tmp, hnsw_path, hash_path)
             },
             |(tmp, hnsw_path, hash_path)| {
@@ -264,7 +304,7 @@ fn bench_b12(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let tmp = TempDir::new().expect("tempdir");
-                let (hnsw_path, hash_path) = seed_baseline(tmp.path());
+                let (hnsw_path, hash_path) = seed_baseline(tmp.path(), &v_add_5pct);
                 (tmp, hnsw_path, hash_path)
             },
             |(tmp, hnsw_path, hash_path)| {
@@ -283,7 +323,7 @@ fn bench_b12(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let tmp = TempDir::new().expect("tempdir");
-                let (hnsw_path, hash_path) = seed_baseline(tmp.path());
+                let (hnsw_path, hash_path) = seed_baseline(tmp.path(), &v_rm_5pct);
                 (tmp, hnsw_path, hash_path)
             },
             |(tmp, hnsw_path, hash_path)| {
@@ -302,7 +342,7 @@ fn bench_b12(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let tmp = TempDir::new().expect("tempdir");
-                let (hnsw_path, hash_path) = seed_baseline(tmp.path());
+                let (hnsw_path, hash_path) = seed_baseline(tmp.path(), &v_10pct);
                 (tmp, hnsw_path, hash_path)
             },
             |(tmp, hnsw_path, hash_path)| {
@@ -320,7 +360,7 @@ fn bench_b12(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let tmp = TempDir::new().expect("tempdir");
-                let (hnsw_path, hash_path) = seed_baseline(tmp.path());
+                let (hnsw_path, hash_path) = seed_baseline(tmp.path(), &v_25pct);
                 (tmp, hnsw_path, hash_path)
             },
             |(tmp, hnsw_path, hash_path)| {
@@ -338,7 +378,7 @@ fn bench_b12(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let tmp = TempDir::new().expect("tempdir");
-                let (hnsw_path, hash_path) = seed_baseline(tmp.path());
+                let (hnsw_path, hash_path) = seed_baseline(tmp.path(), &v_over);
                 (tmp, hnsw_path, hash_path)
             },
             |(tmp, hnsw_path, hash_path)| {
@@ -360,7 +400,7 @@ fn bench_b12(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let tmp = TempDir::new().expect("tempdir");
-                let (hnsw_path, hash_path) = seed_baseline(tmp.path());
+                let (hnsw_path, hash_path) = seed_baseline(tmp.path(), &v_over);
                 (tmp, hnsw_path, hash_path)
             },
             |(tmp, hnsw_path, hash_path)| {
