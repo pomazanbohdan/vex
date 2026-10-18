@@ -152,9 +152,10 @@ pub(super) fn reuse_migration_vectors(
                 .collect::<Vec<_>>();
             for idx in matched {
                 retained_vectors.push(
-                    vectors[idx]
-                        .take()
-                        .expect("migration matches each stored vector at most once"),
+                    vectors
+                        .get_mut(idx)
+                        .and_then(Option::take)
+                        .context("migration match has no stored vector")?,
                 );
             }
             retained_files.push(fresh);
